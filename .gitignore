@@ -1,0 +1,56 @@
+# macOS system files
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Icon must end with two \r
+Icon
+
+# Thumbnails
+._*
+
+# Files that might appear on network shares
+.Spotlight-V100
+.Trashes
+
+# macOS system metadata
+.fseventsd
+.DocumentRevisions-V100
+.TemporaryItems
+.VolumeIcon.icns
+
+# macOS crash logs
+*.crash
+*.ips
+
+# VS Code
+.vscode/
+
+# Xcode
+*.xcuserstate
+xcuserdata/
+DerivedData/
+
+# Node.js
+node_modules/
+npm-debug.log
+yarn-debug.log
+yarn-error.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Logs
+*.log
+
+# Environment files
+.env
+.env.*
+
+# Build directories
+Stp2Tile/build/
+source_data/
+Tile-Viewer/public/

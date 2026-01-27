@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>3D Tiles Viewer</title>
+    <style>
+      html, body { margin: 0; height: 100%; overflow: hidden; }
+      #app { width: 100%; height: 100%; }
+      #hud {
+        position: absolute;
+        left: 12px;
+        top: 12px;
+        padding: 8px 10px;
+        background: rgba(0,0,0,0.55);
+        color: #fff;
+        font: 12px/1.3 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+        border-radius: 8px;
+        user-select: none;
+      }
+      #hud code { color: #d7ffb5; }
+    </style>
+  </head>
+  <body>
+    <div id="app"></div>
+    <div id="hud">
+      Loading <code>tileset.json</code>…<br/>
+      Drag = orbit • Right-drag = pan • Wheel = zoom
+    </div>
+    <script type="module" src="index.js"></script>
+  </body>
+</html>
