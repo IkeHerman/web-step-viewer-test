@@ -30,22 +30,6 @@ namespace
         b.Get(xmin, ymin, zmin, xmax, ymax, zmax);
     }
 
-    static double MaxSideLength(const Bnd_Box& b)
-    {
-        if (b.IsVoid())
-        {
-            return 0.0;
-        }
-
-        double xmin, ymin, zmin, xmax, ymax, zmax;
-        GetMinMax(b, xmin, ymin, zmin, xmax, ymax, zmax);
-
-        const double sx = xmax - xmin;
-        const double sy = ymax - ymin;
-        const double sz = zmax - zmin;
-        return std::max(sx, std::max(sy, sz));
-    }
-
     static double DiagonalLength(const Bnd_Box& b)
     {
         if (b.IsVoid())
@@ -102,17 +86,6 @@ namespace
             hy.X(), hy.Y(), hy.Z(),
             hz.X(), hz.Y(), hz.Z()
         };
-    }
-
-    static double GeometricErrorFromBoundsHeuristic(const Bnd_Box& b)
-    {
-        const double size = MaxSideLength(b);
-        if (size <= 0.0)
-        {
-            return 0.0;
-        }
-
-        return size / 16.0;
     }
 
     static bool HasAnyChild(const TileOctree::Node& node)
@@ -335,6 +308,35 @@ namespace
         return v;
     }
 
+    static float LerpClamped(float a, float b, float t)
+    {
+        const float u = Clamp01(t);
+        return a + (b - a) * u;
+    }
+
+    static double ClampDouble(double v, double lo, double hi)
+    {
+        return std::max(lo, std::min(v, hi));
+    }
+
+    struct NodeTuning
+    {
+        float RelativeSize = 0.0f;
+        float NormalizedDepth = 0.0f;
+        float Importance = 0.0f;
+
+        float ProxyPositionStep = 1e-5f;
+        float LeafPositionStep = 1e-5f;
+
+        float ProxySimplifyRatio = 0.2f;
+        float ProxySimplifyError = 1e-2f;
+
+        float LeafSimplifyRatio = 0.96f;
+        float LeafSimplifyError = 2e-3f;
+
+        double GeometricError = 0.0;
+    };
+
     // SSE-inspired importance:
     // 1. Larger nodes relative to root stay less aggressive.
     // 2. Deeper nodes get somewhat more aggressive.
@@ -363,7 +365,87 @@ namespace
         return importance;
     }
 
-    static glbopt::Options BuildProxyGlbOptOptionsForImportance(float importance)
+    static NodeTuning BuildNodeTuning(
+        const Bnd_Box& nodeBounds,
+        const Bnd_Box& rootBounds,
+        int depthFromRoot,
+        int maxDepth,
+        bool isLeaf)
+    {
+        NodeTuning tuning;
+
+        const double rootDiag = std::max(1e-9, DiagonalLength(rootBounds));
+        const double nodeDiag = std::max(0.0, DiagonalLength(nodeBounds));
+
+        tuning.RelativeSize =
+            Clamp01(static_cast<float>(nodeDiag / rootDiag));
+        tuning.NormalizedDepth =
+            Clamp01(static_cast<float>(depthFromRoot) /
+                    static_cast<float>(std::max(1, maxDepth)));
+        tuning.Importance =
+            ComputeNodeImportance(nodeBounds, rootBounds, depthFromRoot, maxDepth);
+
+        const float aggressiveness =
+            Clamp01((1.0f - tuning.RelativeSize) * 0.65f + tuning.NormalizedDepth * 0.35f);
+
+        const double rootStepMin = rootDiag * 1e-9;
+        const double rootStepProxyMax = rootDiag * 5e-4;
+        const double rootStepLeafMax = rootDiag * 2e-5;
+
+        const double proxyBaseStep = rootDiag * 1e-6;
+        const double leafBaseStep = rootDiag * 2e-7;
+
+        const double proxyStep = ClampDouble(
+            proxyBaseStep * (0.35 + 6.0 * static_cast<double>(aggressiveness)),
+            rootStepMin,
+            std::max(rootStepMin, rootStepProxyMax));
+
+        const double leafStep = ClampDouble(
+            leafBaseStep * (0.8 + 1.6 * static_cast<double>(tuning.NormalizedDepth)),
+            rootStepMin,
+            std::max(rootStepMin, rootStepLeafMax));
+
+        tuning.ProxyPositionStep = static_cast<float>(proxyStep);
+        tuning.LeafPositionStep = static_cast<float>(leafStep);
+
+        // Keep proxy reduction aggressive, but tie to depth and relative size.
+        tuning.ProxySimplifyRatio =
+            LerpClamped(0.06f, 0.34f, 1.0f - aggressiveness);
+
+        // Mild leaf optimization with conservative retention.
+        const float leafAggressiveness =
+            Clamp01(tuning.NormalizedDepth * 0.5f + (1.0f - tuning.RelativeSize) * 0.5f);
+        tuning.LeafSimplifyRatio =
+            LerpClamped(0.98f, 0.90f, leafAggressiveness);
+
+        // Geometric error model scales with both overall extent and node extent.
+        if (!isLeaf)
+        {
+            const double depthBase = (rootDiag / 8.0) * std::pow(0.72, std::max(0, depthFromRoot));
+            const double nodeCap = nodeDiag / 3.5;
+            tuning.GeometricError = std::max(0.0, std::min(depthBase, nodeCap));
+        }
+        else
+        {
+            tuning.GeometricError = 0.0;
+        }
+
+        const double errorFromGeom = std::max(1e-8, tuning.GeometricError / std::max(1e-9, rootDiag));
+
+        tuning.ProxySimplifyError = static_cast<float>(ClampDouble(
+            std::max(0.0025, errorFromGeom * 0.75) * (0.85 + 0.55 * static_cast<double>(tuning.NormalizedDepth)),
+            0.0025,
+            0.06));
+
+        tuning.LeafSimplifyError = static_cast<float>(ClampDouble(
+            std::max(0.0005, errorFromGeom * 0.2),
+            0.0005,
+            0.008));
+
+        return tuning;
+    }
+
+    static glbopt::Options BuildProxyGlbOptOptionsForNode(const NodeTuning& tuning)
     {
         glbopt::Options options;
 
@@ -389,21 +471,21 @@ namespace
         options.OptimizeOverdraw = false;
         options.OptimizeVertexFetch = true;
 
-        options.PositionStep = 0.00001f;
+        options.PositionStep = tuning.ProxyPositionStep;
         options.NormalStep   = 0.001f;
         options.TexcoordStep = 0.0001f;
         options.ColorStep    = 1.0f / 255.0f;
 
         options.DegenerateAreaEpsilonSq = 1e-20f;
         options.Simplify = true;
-        options.SimplifyRatio = 0.05f + 0.20f * Clamp01(importance);
-        options.SimplifyError = 1e-2f;
+        options.SimplifyRatio = tuning.ProxySimplifyRatio;
+        options.SimplifyError = tuning.ProxySimplifyError;
         options.OverdrawThreshold = 1.05f;
 
         return options;
     }
 
-    static glbopt::Options BuildLeafGlbOptOptions()
+    static glbopt::Options BuildLeafGlbOptOptionsForNode(const NodeTuning& tuning)
     {
         glbopt::Options options;
 
@@ -415,7 +497,7 @@ namespace
         options.WeldColor0 = true;
 
         // Keep leaf weld conservative to reduce risk of topology damage.
-        options.PositionStep = 0.00001f;
+        options.PositionStep = tuning.LeafPositionStep;
         options.NormalStep = 0.001f;
         options.TexcoordStep = 0.0001f;
         options.ColorStep = 1.0f / 255.0f;
@@ -423,7 +505,9 @@ namespace
         options.RemoveDegenerateByIndex = true;
         options.RemoveDegenerateByArea = true;
 
-        options.Simplify = false;
+        options.Simplify = true;
+        options.SimplifyRatio = tuning.LeafSimplifyRatio;
+        options.SimplifyError = tuning.LeafSimplifyError;
 
         options.OptimizeVertexCache = true;
         options.OptimizeOverdraw = false;
@@ -451,7 +535,10 @@ namespace
         const TileOctree::Node& node,
         const std::vector<Occurrence>& occurrences,
         const TilesetEmit::Options& opt,
-        BakedNodeArtifact& artifact)
+        BakedNodeArtifact& artifact,
+        int depthFromRoot,
+        int maxDepth,
+        const Bnd_Box& rootBounds)
     {
         const std::string baseName = opt.tileFilePrefix + std::to_string(artifact.nodeId);
         const std::filesystem::path tilesDir =
@@ -475,7 +562,14 @@ namespace
             return false;
         }
 
-        const glbopt::Options leafGlbOptions = BuildLeafGlbOptOptions();
+        const NodeTuning tuning = BuildNodeTuning(
+            artifact.bounds,
+            rootBounds,
+            depthFromRoot,
+            maxDepth,
+            true);
+
+        const glbopt::Options leafGlbOptions = BuildLeafGlbOptOptionsForNode(tuning);
         glbopt::Stats leafGlbStats;
         const bool okOptimize =
             glbopt::OptimizeGlbFile(
@@ -501,6 +595,11 @@ namespace
             const std::size_t trisOut = leafGlbStats.OutputPrimitiveElementCount / 3u;
 
             std::cout << "[LeafGlbOpt] tile=" << baseName
+                      << " depth=" << depthFromRoot
+                      << " relSize=" << tuning.RelativeSize
+                      << " weldPosStep=" << leafGlbOptions.PositionStep
+                      << " simplifyRatio=" << leafGlbOptions.SimplifyRatio
+                      << " simplifyError=" << leafGlbOptions.SimplifyError
                       << " vertsIn=" << leafGlbStats.InputVertexCount
                       << " vertsOut=" << leafGlbStats.OutputVertexCount
                       << " vertsMerged=" << leafGlbStats.MergedVertexCount
@@ -584,14 +683,15 @@ namespace
         const std::filesystem::path proxyGlbPath = tilesDir / (baseName + "_proxy.glb");
         const std::filesystem::path proxyB3dmPath = tilesDir / (baseName + "_proxy.b3dm");
 
-        const float importance = ComputeNodeImportance(
+        const NodeTuning tuning = BuildNodeTuning(
             artifact.bounds,
             rootBounds,
             depthFromRoot,
-            maxDepth);
+            maxDepth,
+            false);
 
         const glbopt::Options glbOptions =
-            BuildProxyGlbOptOptionsForImportance(importance);
+            BuildProxyGlbOptOptionsForNode(tuning);
 
         glbopt::Stats proxyStats;
 
@@ -609,8 +709,13 @@ namespace
             const std::size_t trisOut = proxyStats.OutputPrimitiveElementCount / 3u;
 
             std::cout << "[ProxyGlbOpt] tile=" << baseName
-                      << " importance=" << importance
+                      << " depth=" << depthFromRoot
+                      << " relSize=" << tuning.RelativeSize
+                      << " importance=" << tuning.Importance
+                      << " weldPosStep=" << glbOptions.PositionStep
                       << " simplifyRatio=" << glbOptions.SimplifyRatio
+                      << " simplifyError=" << glbOptions.SimplifyError
+                      << " geomError=" << tuning.GeometricError
                       << " vertsIn=" << proxyStats.InputVertexCount
                       << " vertsOut=" << proxyStats.OutputVertexCount
                       << " trisIn=" << trisIn
@@ -706,7 +811,14 @@ namespace
         bool ok = false;
         if (artifact.isLeaf)
         {
-            ok = BakeLeafArtifacts(node, occurrences, opt, artifact);
+            ok = BakeLeafArtifacts(
+                node,
+                occurrences,
+                opt,
+                artifact,
+                depthFromRoot,
+                maxDepth,
+                rootBounds);
         }
         else
         {
@@ -734,6 +846,9 @@ namespace
         const TileOctree::Node& node,
         const BakeState& bakeState,
         int depth,
+        int depthFromRoot,
+        int maxDepth,
+        const Bnd_Box& rootBounds,
         double parentGeometricError,
         bool isRoot)
     {
@@ -767,10 +882,16 @@ namespace
         double geometricError = 0.0;
         if (!artifact.isLeaf)
         {
-            geometricError = GeometricErrorFromBoundsHeuristic(artifact.bounds);
+            const NodeTuning tuning = BuildNodeTuning(
+                artifact.bounds,
+                rootBounds,
+                depthFromRoot,
+                maxDepth,
+                false);
+            geometricError = tuning.GeometricError;
             if (!isRoot && parentGeometricError > 0.0)
             {
-                const double maxAllowed = parentGeometricError * 0.5;
+                const double maxAllowed = parentGeometricError * 0.7;
                 geometricError = std::min(geometricError, maxAllowed);
             }
         }
@@ -805,7 +926,16 @@ namespace
 
             for (std::size_t i = 0; i < children.size(); ++i)
             {
-                EmitJsonNode(ss, *children[i], bakeState, depth + 2, geometricError, false);
+                EmitJsonNode(
+                    ss,
+                    *children[i],
+                    bakeState,
+                    depth + 2,
+                    depthFromRoot + 1,
+                    maxDepth,
+                    rootBounds,
+                    geometricError,
+                    false);
                 if (i + 1 < children.size())
                 {
                     ss << ",";
@@ -856,8 +986,13 @@ namespace TilesetEmit
             return false;
         }
 
-        const double rootGeometricError =
-            GeometricErrorFromBoundsHeuristic(rootIt->second.bounds);
+        const NodeTuning rootTuning = BuildNodeTuning(
+            rootIt->second.bounds,
+            rootBounds,
+            0,
+            maxDepth,
+            false);
+        const double rootGeometricError = rootTuning.GeometricError;
 
         std::ostringstream ss;
         ss << "{\n";
@@ -865,7 +1000,16 @@ namespace TilesetEmit
         ss << "  \"geometricError\":" << std::setprecision(15) << rootGeometricError << ",\n";
         ss << "  \"root\":\n";
 
-        EmitJsonNode(ss, tree.Root(), bakeState, 2, rootGeometricError, true);
+        EmitJsonNode(
+            ss,
+            tree.Root(),
+            bakeState,
+            2,
+            0,
+            maxDepth,
+            rootBounds,
+            rootGeometricError,
+            true);
 
         ss << "\n}\n";
 

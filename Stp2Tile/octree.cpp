@@ -284,13 +284,13 @@ void TileOctree::BuildNode(Node& node,
     }
 
     const bool oneBucketGotEverything = (largestBucketSize == inputItems.size());
-    const bool poorItemSplit = (largestBucketSize >= (inputItems.size() * 95) / 100);
+    const bool poorItemSplit = (largestBucketSize >= (inputItems.size() * 98) / 100);
     const bool poorTriangleSplit =
         (totalTriangles > 0) &&
-        (largestBucketTriangles >= (totalTriangles * 95) / 100);
+        (largestBucketTriangles >= (totalTriangles * 98) / 100);
     const bool allForced = (forcedCount == static_cast<int>(inputItems.size()));
 
-    if (oneBucketGotEverything || poorItemSplit || poorTriangleSplit || allForced)
+    if (oneBucketGotEverything || poorItemSplit || poorTriangleSplit)
     {
         if (m_cfg.verbose)
         {
@@ -301,6 +301,7 @@ void TileOctree::BuildNode(Node& node,
                       << ", children=" << nonEmptyChildCount
                       << ", contained=" << containedCount
                       << ", forced=" << forcedCount
+                      << ", allForced=" << (allForced ? "true" : "false")
                       << ", largestBucketItems=" << largestBucketSize
                       << ", largestBucketTriangles=" << largestBucketTriangles
                       << ")\n";

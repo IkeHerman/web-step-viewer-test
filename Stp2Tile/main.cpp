@@ -111,6 +111,21 @@ static void UpdateGlobalBounds(Bnd_Box& globalBox, const Bnd_Box& newBox)
     globalBox.Update(xmin, ymin, zmin, xmax, ymax, zmax);
 }
 
+static double BoundsMaxSideLength(const Bnd_Box& box)
+{
+    if (box.IsVoid())
+    {
+        return 0.0;
+    }
+
+    Standard_Real xmin, ymin, zmin, xmax, ymax, zmax;
+    box.Get(xmin, ymin, zmin, xmax, ymax, zmax);
+    const double sx = static_cast<double>(xmax - xmin);
+    const double sy = static_cast<double>(ymax - ymin);
+    const double sz = static_cast<double>(zmax - zmin);
+    return std::max(sx, std::max(sy, sz));
+}
+
 static bool IsStepPath(const std::filesystem::path& p)
 {
     std::string ext = p.extension().string();
@@ -1174,12 +1189,14 @@ int main(int argc, char** argv)
  
         std::cout << "[Stage] Begin octree build\n";
 
+        const double rootMaxSide = BoundsMaxSideLength(globalBounds);
+
         TileOctree::Config cfg;
-        cfg.maxDepth = 8;
-        cfg.maxItemsPerNode = 128;
-        cfg.maxTrianglesPerNode = 50000;
-        cfg.minNodeMaxSide = 1.0;
-        cfg.looseFactor = 1.5;
+        cfg.maxDepth = 10;
+        cfg.maxItemsPerNode = 96;
+        cfg.maxTrianglesPerNode = 30000;
+        cfg.minNodeMaxSide = std::max(1e-6, rootMaxSide * 1e-3);
+        cfg.looseFactor = 1.8;
         cfg.verbose = cli.verbose;
 
         TileOctree tree(cfg);
