@@ -540,6 +540,15 @@ struct SolidCacheEntry
     std::uint32_t TriangleCount = 0;
 };
 
+struct NonRenderableLeafInfo
+{
+    std::string Label;
+    std::string Name;
+    TopAbs_ShapeEnum Type = TopAbs_SHAPE;
+    int ShellCount = 0;
+    int FaceCount = 0;
+};
+
 static void PromoteFaceColorToShapeFallback(CachedOccurrenceAppearance& appearance)
 {
     CachedColorSet& shape = appearance.ResolvedShapeColors;
@@ -587,30 +596,31 @@ static std::size_t EmitSolidOccurrencesFromShape(
     std::unordered_map<SolidCacheKey, SolidCacheEntry, SolidCacheKeyHasher>& solidCache,
     std::vector<Occurrence>& occurrences,
     Bnd_Box& globalBounds,
-    std::uint64_t& totalTriangles)
+    std::uint64_t& totalTriangles,
+    TopAbs_ShapeEnum targetType)
 {
     std::size_t emitted = 0;
 
-    for (TopExp_Explorer ex(sourceShape, TopAbs_SOLID); ex.More(); ex.Next())
+    for (TopExp_Explorer ex(sourceShape, targetType); ex.More(); ex.Next())
     {
-        const TopoDS_Shape solidShape = ex.Current();
-        if (solidShape.IsNull())
+        const TopoDS_Shape emittedShape = ex.Current();
+        if (emittedShape.IsNull())
             continue;
 
-        const TopLoc_Location solidLocalLoc = solidShape.Location();
-        const TopLoc_Location solidWorldLoc = parentWorldLoc * solidLocalLoc;
-        const gp_Trsf solidWorldTrsf = solidWorldLoc.Transformation();
-        const TopoDS_Shape solidShapeAtLocalOrigin = solidShape.Located(TopLoc_Location());
+        const TopLoc_Location emittedLocalLoc = emittedShape.Location();
+        const TopLoc_Location emittedWorldLoc = parentWorldLoc * emittedLocalLoc;
+        const gp_Trsf emittedWorldTrsf = emittedWorldLoc.Transformation();
+        const TopoDS_Shape emittedShapeAtLocalOrigin = emittedShape.Located(TopLoc_Location());
 
-        const SolidCacheKey cacheKey = MakeSolidCacheKey(solidShapeAtLocalOrigin);
+        const SolidCacheKey cacheKey = MakeSolidCacheKey(emittedShapeAtLocalOrigin);
         std::unordered_map<SolidCacheKey, SolidCacheEntry, SolidCacheKeyHasher>::iterator it =
             solidCache.find(cacheKey);
 
         if (it == solidCache.end())
         {
             SolidCacheEntry entry;
-            entry.LocalBounds = ComputeLocalBounds(solidShapeAtLocalOrigin);
-            entry.TriangleCount = SafeEstimateTriangles(solidShapeAtLocalOrigin, sourceLabel);
+            entry.LocalBounds = ComputeLocalBounds(emittedShapeAtLocalOrigin);
+            entry.TriangleCount = SafeEstimateTriangles(emittedShapeAtLocalOrigin, sourceLabel);
 
             it = solidCache.emplace(cacheKey, std::move(entry)).first;
         }
@@ -624,21 +634,21 @@ static std::size_t EmitSolidOccurrencesFromShape(
             sourceLabel,
             effectiveLabel,
             sourceShape,
-            solidShapeAtLocalOrigin);
+            emittedShapeAtLocalOrigin);
         appearance->ResolvedShapeMaterial = ResolveVisMaterialForOccurrence(
             visMatTool,
             sourceLabel,
             effectiveLabel,
             sourceShape,
-            solidShapeAtLocalOrigin);
+            emittedShapeAtLocalOrigin);
         appearance->Faces = ExtractFaceAppearance(
             colorTool,
             visMatTool,
-            solidShapeAtLocalOrigin);
+            emittedShapeAtLocalOrigin);
         PromoteFaceColorToShapeFallback(*appearance);
 
-        const Bnd_Box solidWorldBounds = cached.LocalBounds.Transformed(solidWorldTrsf);
-        UpdateGlobalBounds(globalBounds, solidWorldBounds);
+        const Bnd_Box emittedWorldBounds = cached.LocalBounds.Transformed(emittedWorldTrsf);
+        UpdateGlobalBounds(globalBounds, emittedWorldBounds);
         const std::uint32_t triangleCount = cached.TriangleCount;
 
         try
@@ -646,9 +656,9 @@ static std::size_t EmitSolidOccurrencesFromShape(
             Occurrence occ;
             occ.Label = sourceLabel;
             occ.EffectiveLabel = effectiveLabel;
-            occ.Shape = solidShapeAtLocalOrigin;
-            occ.WorldTransform = solidWorldTrsf;
-            occ.WorldBounds = solidWorldBounds;
+            occ.Shape = emittedShapeAtLocalOrigin;
+            occ.WorldTransform = emittedWorldTrsf;
+            occ.WorldBounds = emittedWorldBounds;
             occ.TriangleCount = triangleCount;
             occ.Appearance = appearance;
 
@@ -677,6 +687,58 @@ static std::size_t EmitSolidOccurrencesFromShape(
     return emitted;
 }
 
+static std::size_t EmitSolidOccurrencesFromShape(
+    const TDF_Label& sourceLabel,
+    const TDF_Label& effectiveLabel,
+    const TopoDS_Shape& sourceShape,
+    const Handle(XCAFDoc_ColorTool)& colorTool,
+    const Handle(XCAFDoc_VisMaterialTool)& visMatTool,
+    const TopLoc_Location& parentWorldLoc,
+    std::unordered_map<SolidCacheKey, SolidCacheEntry, SolidCacheKeyHasher>& solidCache,
+    std::vector<Occurrence>& occurrences,
+    Bnd_Box& globalBounds,
+    std::uint64_t& totalTriangles)
+{
+    return EmitSolidOccurrencesFromShape(
+        sourceLabel,
+        effectiveLabel,
+        sourceShape,
+        colorTool,
+        visMatTool,
+        parentWorldLoc,
+        solidCache,
+        occurrences,
+        globalBounds,
+        totalTriangles,
+        TopAbs_SOLID);
+}
+
+static std::size_t EmitShellOccurrencesFromShape(
+    const TDF_Label& sourceLabel,
+    const TDF_Label& effectiveLabel,
+    const TopoDS_Shape& sourceShape,
+    const Handle(XCAFDoc_ColorTool)& colorTool,
+    const Handle(XCAFDoc_VisMaterialTool)& visMatTool,
+    const TopLoc_Location& parentWorldLoc,
+    std::unordered_map<SolidCacheKey, SolidCacheEntry, SolidCacheKeyHasher>& solidCache,
+    std::vector<Occurrence>& occurrences,
+    Bnd_Box& globalBounds,
+    std::uint64_t& totalTriangles)
+{
+    return EmitSolidOccurrencesFromShape(
+        sourceLabel,
+        effectiveLabel,
+        sourceShape,
+        colorTool,
+        visMatTool,
+        parentWorldLoc,
+        solidCache,
+        occurrences,
+        globalBounds,
+        totalTriangles,
+        TopAbs_SHELL);
+}
+
 static void TraverseLabelToSolids(
     const Handle(XCAFDoc_ShapeTool)& shapeTool,
     const Handle(XCAFDoc_ColorTool)& colorTool,
@@ -687,7 +749,10 @@ static void TraverseLabelToSolids(
     std::vector<Occurrence>& occurrences,
     Bnd_Box& globalBounds,
     std::size_t& traversedLeafLabels,
-    std::size_t& labelsWithNoSolids,
+    std::size_t& labelsWithNoRenderableGeometry,
+    std::size_t& labelsWithShellFallback,
+    std::size_t& nonAssemblyLabelsWithComponents,
+    std::vector<NonRenderableLeafInfo>& nonRenderableLeaves,
     std::uint64_t& totalTriangles)
 {
     if (label.IsNull())
@@ -721,10 +786,35 @@ static void TraverseLabelToSolids(
                 occurrences,
                 globalBounds,
                 traversedLeafLabels,
-                labelsWithNoSolids,
+                labelsWithNoRenderableGeometry,
+                labelsWithShellFallback,
+                nonAssemblyLabelsWithComponents,
+                nonRenderableLeaves,
                 totalTriangles);
         }
         return;
+    }
+
+    const TopoDS_Shape shape = shapeTool->GetShape(effectiveLabel);
+    if (shape.IsNull())
+    {
+        std::cerr << "Warning: null shape for label " << LabelToString(effectiveLabel) << "\n";
+        return;
+    }
+
+    TDF_LabelSequence probeComponents;
+    shapeTool->GetComponents(effectiveLabel, probeComponents);
+    if (probeComponents.Length() > 0)
+    {
+        ++nonAssemblyLabelsWithComponents;
+        if (g_verboseLogging)
+        {
+            std::cerr << "Warning: non-assembly label has components"
+                      << " label=" << LabelToString(effectiveLabel)
+                      << " type=" << ShapeTypeName(shape.ShapeType())
+                      << " componentCount=" << probeComponents.Length()
+                      << "\n";
+        }
     }
 
     ++traversedLeafLabels;
@@ -735,15 +825,8 @@ static void TraverseLabelToSolids(
                   << " occurrences=" << occurrences.size() << "\n";
     }
 
-    const TopoDS_Shape shape = shapeTool->GetShape(effectiveLabel);
-    if (shape.IsNull())
-    {
-        std::cerr << "Warning: null shape for label " << LabelToString(effectiveLabel) << "\n";
-        return;
-    }
-
     const std::size_t beforeCount = occurrences.size();
-    const std::size_t emitted = EmitSolidOccurrencesFromShape(
+    const std::size_t emittedSolids = EmitSolidOccurrencesFromShape(
         label,
         effectiveLabel,
         shape,
@@ -755,11 +838,38 @@ static void TraverseLabelToSolids(
         globalBounds,
         totalTriangles);
 
+    std::size_t emitted = emittedSolids;
+    if (emittedSolids == 0)
+    {
+        emitted = EmitShellOccurrencesFromShape(
+            label,
+            effectiveLabel,
+            shape,
+            colorTool,
+            visMatTool,
+            worldLoc,
+            solidCache,
+            occurrences,
+            globalBounds,
+            totalTriangles);
+    }
+
     if (emitted == 0)
     {
+        const int shellCount = CountSubshapes(shape, TopAbs_SHELL);
+        const int faceCount = CountSubshapes(shape, TopAbs_FACE);
+
+        NonRenderableLeafInfo info;
+        info.Label = LabelToString(effectiveLabel);
+        info.Name = GetLabelName(effectiveLabel);
+        info.Type = shape.ShapeType();
+        info.ShellCount = shellCount;
+        info.FaceCount = faceCount;
+        nonRenderableLeaves.push_back(std::move(info));
+
         if (g_verboseLogging)
         {
-            ++labelsWithNoSolids;
+            ++labelsWithNoRenderableGeometry;
 
             std::cerr << "Warning: no solids found for leaf label "
                       << LabelToString(effectiveLabel);
@@ -769,13 +879,26 @@ static void TraverseLabelToSolids(
                 std::cerr << " name=\"" << name << "\"";
 
             std::cerr << " type=" << ShapeTypeName(shape.ShapeType())
-                      << " shells=" << CountSubshapes(shape, TopAbs_SHELL)
-                      << " faces=" << CountSubshapes(shape, TopAbs_FACE)
+                      << " shells=" << shellCount
+                      << " faces=" << faceCount
                       << "\n";
         }
     }
     else
     {
+        if (emittedSolids == 0)
+        {
+            ++labelsWithShellFallback;
+
+            if (g_verboseLogging)
+            {
+                std::cerr << "Info: emitted shell fallback for leaf label "
+                          << LabelToString(effectiveLabel)
+                          << " shells=" << emitted
+                          << "\n";
+            }
+        }
+
         const std::size_t added = occurrences.size() - beforeCount;
         if (added != emitted)
         {
@@ -911,7 +1034,10 @@ int main(int argc, char** argv)
         globalBounds.SetVoid();
 
         std::size_t traversedLeafLabels = 0;
-        std::size_t labelsWithNoSolids = 0;
+        std::size_t labelsWithNoRenderableGeometry = 0;
+        std::size_t labelsWithShellFallback = 0;
+        std::size_t nonAssemblyLabelsWithComponents = 0;
+        std::vector<NonRenderableLeafInfo> nonRenderableLeaves;
         std::uint64_t totalTriangles = 0;
         std::size_t totalRoots = 0;
         std::unordered_map<SolidCacheKey, SolidCacheEntry, SolidCacheKeyHasher> solidCache;
@@ -940,7 +1066,10 @@ int main(int argc, char** argv)
                     occurrences,
                     globalBounds,
                     traversedLeafLabels,
-                    labelsWithNoSolids,
+                    labelsWithNoRenderableGeometry,
+                    labelsWithShellFallback,
+                    nonAssemblyLabelsWithComponents,
+                    nonRenderableLeaves,
                     totalTriangles);
             }
         }
@@ -950,9 +1079,38 @@ int main(int argc, char** argv)
             std::cout << "[Stage] Solid traversal complete\n";
             std::cout << "Found " << totalRoots << " free roots\n";
             std::cout << "Traversed " << traversedLeafLabels << " non-assembly labels\n";
-            std::cout << "Built " << occurrences.size() << " solid occurrences\n";
+            std::cout << "Built " << occurrences.size() << " occurrences\n";
             std::cout << "Estimated solids tris=" << totalTriangles << "\n";
-            std::cout << "Labels with no solids: " << labelsWithNoSolids << "\n";
+            std::cout << "Labels with shell fallback: " << labelsWithShellFallback << "\n";
+            std::cout << "Labels with no renderable geometry: " << labelsWithNoRenderableGeometry << "\n";
+            std::cout << "Non-assembly labels with components (probe): "
+                      << nonAssemblyLabelsWithComponents << "\n";
+            if (!nonRenderableLeaves.empty())
+            {
+                std::cout << "Non-renderable leaves:\n";
+                const std::size_t maxToPrint = 20;
+                const std::size_t printCount = std::min(maxToPrint, nonRenderableLeaves.size());
+
+                for (std::size_t i = 0; i < printCount; ++i)
+                {
+                    const NonRenderableLeafInfo& info = nonRenderableLeaves[i];
+                    std::cout << "  - label=" << info.Label;
+                    if (!info.Name.empty())
+                    {
+                        std::cout << " name=\"" << info.Name << "\"";
+                    }
+                    std::cout << " type=" << ShapeTypeName(info.Type)
+                              << " shells=" << info.ShellCount
+                              << " faces=" << info.FaceCount
+                              << "\n";
+                }
+
+                if (nonRenderableLeaves.size() > printCount)
+                {
+                    std::cout << "  ... (" << (nonRenderableLeaves.size() - printCount)
+                              << " more)\n";
+                }
+            }
             std::cout << "Global bounds: ";
             PrintBounds(globalBounds);
             std::cout << "\n\n";
