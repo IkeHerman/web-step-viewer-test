@@ -7,16 +7,16 @@ import { TilesRenderer } from "3d-tiles-renderer";
 // CONFIG
 // ----------------------------------------------------
 const TILESET_URL = "/tileset.json";
-const FORCE_NON_PROXY_CONTENT = true;
-const TARGET_SCREEN_SPACE_ERROR = 1.0;
+const FORCE_NON_PROXY_CONTENT = false;
+const TARGET_SCREEN_SPACE_ERROR = 14.0;
+const MAX_TILE_DEPTH = 6;
+const INITIAL_AXIS_FIX = "flip-x-180"; // none | flip-x-180 | z-up-to-y-up
 
 // ----------------------------------------------------
 // DOM
 // ----------------------------------------------------
 const app = document.getElementById("app");
 const hud = document.getElementById("hud");
-const debugDump = document.getElementById("debugDump");
-const copyDebugBtn = document.getElementById("copyDebugBtn");
 
 // ----------------------------------------------------
 // Debug state
@@ -44,8 +44,19 @@ const _tmpWorldSphere = new THREE.Sphere();
 const _tmpMatrixPos = new THREE.Vector3();
 let lastDebugCompactLine = "";
 let lastFrameStats = null;
-let loadedProxyTiles = 0;
-let loadedFullTiles = 0;
+let hasLoadedAnyTile = false;
+const visibleProxyTiles = new Set();
+const visibleLeafTiles = new Set();
+
+function isProxyTile(tile) {
+  const tileUri =
+    tile?.content?.uri ||
+    tile?.content?.url ||
+    tile?.contentUrl ||
+    "";
+
+  return /_proxy\.b3dm(?:$|[?#])/i.test(`${tileUri}`);
+}
 
 const geometryDebug = {
   meshSeen: 0,
@@ -126,42 +137,6 @@ function collectGeometrySnapshot(maxMeshes = 10) {
   return summary;
 }
 
-function updateDebugDump(snapshot = null) {
-  if (!debugDump) return;
-
-  const lines = [
-    `F_DEBUG ${lastDebugCompactLine || "no-metrics-yet"}`,
-    `F_DEBUG_FRAME ${JSON.stringify(lastFrameStats || {})}`,
-  ];
-
-  if (snapshot) {
-    lines.push(`F_DEBUG_GEOM ${JSON.stringify(snapshot)}`);
-  }
-
-  debugDump.value = lines.join("\n");
-}
-
-if (copyDebugBtn) {
-  copyDebugBtn.addEventListener("click", async () => {
-    if (!debugDump) return;
-    debugDump.select();
-    debugDump.setSelectionRange(0, debugDump.value.length);
-
-    try {
-      await navigator.clipboard.writeText(debugDump.value);
-      copyDebugBtn.textContent = "Copied";
-      setTimeout(() => {
-        copyDebugBtn.textContent = "Copy Debug";
-      }, 900);
-    } catch (_) {
-      copyDebugBtn.textContent = "Select+C";
-      setTimeout(() => {
-        copyDebugBtn.textContent = "Copy Debug";
-      }, 900);
-    }
-  });
-}
-
 // ----------------------------------------------------
 // Renderer
 // ----------------------------------------------------
@@ -225,6 +200,20 @@ scene.add(fill);
 // ----------------------------------------------------
 const tiles = new TilesRenderer(TILESET_URL);
 
+function applyInitialAxisFix(target) {
+  if (!target) return;
+
+  target.rotation.set(0, 0, 0);
+
+  if (INITIAL_AXIS_FIX === "flip-x-180") {
+    target.rotation.x = Math.PI;
+  } else if (INITIAL_AXIS_FIX === "z-up-to-y-up") {
+    target.rotation.x = -Math.PI * 0.5;
+  }
+
+  target.updateMatrixWorld(true);
+}
+
 if (FORCE_NON_PROXY_CONTENT) {
   const manager = tiles.manager || tiles.loadingManager;
   if (manager?.setURLModifier) {
@@ -237,17 +226,8 @@ if (FORCE_NON_PROXY_CONTENT) {
   }
 }
 
-tiles.addEventListener?.("tile-load", (e) => {
-  const loadedUri =
-    e?.url ||
-    e?.tile?.content?.uri ||
-    e?.tile?.contentUrl ||
-    e?.tile?.cached?.uri ||
-    "";
-  if (/_proxy\.b3dm$/i.test(loadedUri)) loadedProxyTiles++;
-  else if (/\.b3dm$/i.test(loadedUri)) loadedFullTiles++;
-
-  console.log("tile-load", loadedUri || e);
+tiles.addEventListener?.("load-model", (e) => {
+  hasLoadedAnyTile = true;
 
   const tileScene = e?.scene || e?.tile?.cached?.scene;
   if (tileScene) {
@@ -286,8 +266,34 @@ tiles.addEventListener?.("tile-load", (e) => {
   }
 });
 
-tiles.addEventListener?.("tile-error", (e) => {
-  console.error("tile-error", e);
+tiles.addEventListener?.("load-error", (e) => {
+  console.error("load-error", e);
+});
+
+tiles.addEventListener?.("dispose-model", (e) => {
+  const tile = e?.tile;
+  if (!tile) return;
+
+  visibleLeafTiles.delete(tile);
+  visibleProxyTiles.delete(tile);
+});
+
+tiles.addEventListener?.("tile-visibility-change", (e) => {
+  const tile = e?.tile;
+  if (!tile) return;
+
+  if (e?.visible) {
+    if (isProxyTile(tile)) {
+      visibleProxyTiles.add(tile);
+      visibleLeafTiles.delete(tile);
+    } else {
+      visibleLeafTiles.add(tile);
+      visibleProxyTiles.delete(tile);
+    }
+  } else {
+    visibleLeafTiles.delete(tile);
+    visibleProxyTiles.delete(tile);
+  }
 });
 
 tiles.addEventListener?.("load-tileset", () => {
@@ -312,7 +318,7 @@ tiles.setCamera(camera);
 tiles.setResolutionFromRenderer(camera, renderer);
 
 tiles.errorTarget = TARGET_SCREEN_SPACE_ERROR;
-tiles.maxDepth = Infinity;
+tiles.maxDepth = MAX_TILE_DEPTH;
 
 // Ensure base path is correct
 try {
@@ -321,6 +327,7 @@ try {
 } catch (_) {}
 
 // Add tiles to scene
+applyInitialAxisFix(tiles.group);
 scene.add(tiles.group);
 
 // ----------------------------------------------------
@@ -760,7 +767,6 @@ window.addEventListener("keydown", (event) => {
       {
         const snapshot = collectGeometrySnapshot(12);
         console.log("F_DEBUG_GEOM", snapshot);
-        updateDebugDump(snapshot);
       }
       break;
     default:
@@ -837,7 +843,7 @@ function animate() {
     `a=${geometryDebug.attrFallbackUsed}-${geometryDebug.attrFallbackInvalid} ` +
     `p=${geometryDebug.sampleFinite}-${geometryDebug.sampleInvalid} ` +
     `pt=${geometryDebug.totalPositionCount}/${geometryDebug.totalSamplesTried} ` +
-    `u=${loadedFullTiles}/${loadedProxyTiles} ` +
+    `u=${visibleLeafTiles.size}/${visibleProxyTiles.size} ` +
     `pf=${geometryDebug.pointFallbackUsed}`;
   lastDebugCompactLine =
     `geomRadius=${isFinite(geomRadius) ? geomRadius.toFixed(2) : "n/a"} ` +
@@ -849,13 +855,11 @@ function animate() {
     debugCompact,
   };
 
+  const loadingLine = hasLoadedAnyTile ? "Tiles loaded" : "Tiles are loading...";
   hud.textContent =
-    "Loaded tileset — WASD/RF to fly, mouse drag to look\n" +
-    `mode=${debugState.mode} | doubleSided=${debugState.doubleSided ? "on" : "off"} | bounds=${debugState.showBounds ? "on" : "off"}\n` +
-    `meshes=${meshCount} hidden=${hiddenMeshCount} tris~${Math.floor(triCount)} darkMats~${blackMaterialCount}\n` +
-    `geomRadius~${isFinite(geomRadius) ? geomRadius.toFixed(2) : "n/a"} camDist~${isFinite(cameraToGeom) ? cameraToGeom.toFixed(2) : "n/a"}\n` +
-    `${debugCompact}\n` +
-    "keys: 1=original 2=wireframe 3=normals 4=unlit D=double-sided B=bounds F=frame";
+    `${loadingLine}\n` +
+    `Meshes: ${meshCount} | Triangles: ~${Math.floor(triCount)}\n` +
+    `Leaf tiles: ${visibleLeafTiles.size} | Proxy tiles: ${visibleProxyTiles.size}`;
 
   //updateGeometryBounds();
 }
