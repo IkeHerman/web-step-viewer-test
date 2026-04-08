@@ -7,16 +7,15 @@
 #include <vector>
 
 #include <TDocStd_Document.hxx>
-#include <XCAFDoc_ShapeTool.hxx>
 
 Handle(TDocStd_Document) CreateEmptyXcafDocument();
 
 bool ExportTileToGlbFile(
-    const Handle(XCAFDoc_ShapeTool)& sourceShapeTool,
     const std::vector<Occurrence>& occurrences,
     const std::vector<std::uint32_t>& itemIndices,
     const std::string& glbPath,
-    const float decimationFactor
+    const float decimationFactor,
+    const bool debugAppearance
     );
 
 bool ExportBoxToGlbFile(

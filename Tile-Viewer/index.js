@@ -1,17 +1,166 @@
 import * as THREE from "three";
 import { FlyControls } from "three/examples/jsm/controls/FlyControls.js";
+import { RoomEnvironment } from "three/examples/jsm/environments/RoomEnvironment.js";
 import { TilesRenderer } from "3d-tiles-renderer";
 
 // ----------------------------------------------------
 // CONFIG
 // ----------------------------------------------------
 const TILESET_URL = "/tileset.json";
+const FORCE_NON_PROXY_CONTENT = true;
+const TARGET_SCREEN_SPACE_ERROR = 1.0;
 
 // ----------------------------------------------------
 // DOM
 // ----------------------------------------------------
 const app = document.getElementById("app");
 const hud = document.getElementById("hud");
+const debugDump = document.getElementById("debugDump");
+const copyDebugBtn = document.getElementById("copyDebugBtn");
+
+// ----------------------------------------------------
+// Debug state
+// ----------------------------------------------------
+const debugState = {
+  mode: "original", // original | wireframe | normals | unlit
+  doubleSided: false,
+  showBounds: false,
+};
+
+const meshOriginalMaterials = new WeakMap();
+const meshDebugMaterials = new WeakMap();
+const originalMaterialSides = new WeakMap();
+let rootBoundsHelper = null;
+let didFrameFromGeometry = false;
+let needsGeometryRefit = false;
+
+const _tmpBox = new THREE.Box3();
+const _tmpSphere = new THREE.Sphere();
+const _tmpCenter = new THREE.Vector3();
+const _tmpOffset = new THREE.Vector3();
+const _tmpUnionMin = new THREE.Vector3();
+const _tmpUnionMax = new THREE.Vector3();
+const _tmpWorldSphere = new THREE.Sphere();
+const _tmpMatrixPos = new THREE.Vector3();
+let lastDebugCompactLine = "";
+let lastFrameStats = null;
+let loadedProxyTiles = 0;
+let loadedFullTiles = 0;
+
+const geometryDebug = {
+  meshSeen: 0,
+  meshWithGeometry: 0,
+  meshWithPosition: 0,
+  matrixValid: 0,
+  matrixInvalid: 0,
+  sphereValid: 0,
+  sphereInvalid: 0,
+  boxValid: 0,
+  boxInvalid: 0,
+  attrFallbackUsed: 0,
+  attrFallbackInvalid: 0,
+  sampleFinite: 0,
+  sampleInvalid: 0,
+  pointFallbackUsed: 0,
+  totalPositionCount: 0,
+  totalSamplesTried: 0,
+};
+
+function collectGeometrySnapshot(maxMeshes = 10) {
+  const summary = {
+    meshCount: 0,
+    withGeometry: 0,
+    withPosition: 0,
+    totalPositionCount: 0,
+    samplesTried: 0,
+    finiteSamples: 0,
+    invalidSamples: 0,
+    examples: [],
+  };
+
+  tiles.group.updateMatrixWorld(true);
+
+  tiles.group.traverse((obj) => {
+    if (!obj.isMesh) return;
+    summary.meshCount++;
+    if (!obj.geometry) return;
+    summary.withGeometry++;
+
+    const position = obj.geometry.attributes?.position;
+    if (!position) return;
+    summary.withPosition++;
+    summary.totalPositionCount += position.count;
+
+    const sampleCount = Math.min(position.count, 16);
+    let meshFinite = 0;
+    let meshInvalid = 0;
+
+    for (let i = 0; i < sampleCount; i++) {
+      _tmpMatrixPos.set(
+        position.getX(i),
+        position.getY(i),
+        position.itemSize >= 3 ? position.getZ(i) : 0
+      ).applyMatrix4(obj.matrixWorld);
+
+      summary.samplesTried++;
+      if (isFinite(_tmpMatrixPos.x) && isFinite(_tmpMatrixPos.y) && isFinite(_tmpMatrixPos.z)) {
+        summary.finiteSamples++;
+        meshFinite++;
+      } else {
+        summary.invalidSamples++;
+        meshInvalid++;
+      }
+    }
+
+    if (summary.examples.length < maxMeshes) {
+      summary.examples.push({
+        name: obj.name || "(unnamed)",
+        positionCount: position.count,
+        sampled: sampleCount,
+        finite: meshFinite,
+        invalid: meshInvalid,
+      });
+    }
+  });
+
+  return summary;
+}
+
+function updateDebugDump(snapshot = null) {
+  if (!debugDump) return;
+
+  const lines = [
+    `F_DEBUG ${lastDebugCompactLine || "no-metrics-yet"}`,
+    `F_DEBUG_FRAME ${JSON.stringify(lastFrameStats || {})}`,
+  ];
+
+  if (snapshot) {
+    lines.push(`F_DEBUG_GEOM ${JSON.stringify(snapshot)}`);
+  }
+
+  debugDump.value = lines.join("\n");
+}
+
+if (copyDebugBtn) {
+  copyDebugBtn.addEventListener("click", async () => {
+    if (!debugDump) return;
+    debugDump.select();
+    debugDump.setSelectionRange(0, debugDump.value.length);
+
+    try {
+      await navigator.clipboard.writeText(debugDump.value);
+      copyDebugBtn.textContent = "Copied";
+      setTimeout(() => {
+        copyDebugBtn.textContent = "Copy Debug";
+      }, 900);
+    } catch (_) {
+      copyDebugBtn.textContent = "Select+C";
+      setTimeout(() => {
+        copyDebugBtn.textContent = "Copy Debug";
+      }, 900);
+    }
+  });
+}
 
 // ----------------------------------------------------
 // Renderer
@@ -20,6 +169,8 @@ const renderer = new THREE.WebGLRenderer({ antialias: true });
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.1;
 app.appendChild(renderer.domElement);
 
 // ----------------------------------------------------
@@ -27,6 +178,9 @@ app.appendChild(renderer.domElement);
 // ----------------------------------------------------
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x111111);
+const pmremGenerator = new THREE.PMREMGenerator(renderer);
+scene.environment = pmremGenerator.fromScene(new RoomEnvironment(), 0.04).texture;
+pmremGenerator.dispose();
 
 // ----------------------------------------------------
 // Camera
@@ -56,12 +210,13 @@ controls.autoForward = false;
 // Lights
 // ----------------------------------------------------
 scene.add(new THREE.HemisphereLight(0xffffff, 0x222233, 0.8));
+scene.add(new THREE.AmbientLight(0xffffff, 0.35));
 
-const key = new THREE.DirectionalLight(0xffffff, 1.2);
+const key = new THREE.DirectionalLight(0xffffff, 1.8);
 key.position.set(5, 8, 3);
 scene.add(key);
 
-const fill = new THREE.DirectionalLight(0xffffff, 0.6);
+const fill = new THREE.DirectionalLight(0xffffff, 0.9);
 fill.position.set(-6, 3, -4);
 scene.add(fill);
 
@@ -70,8 +225,65 @@ scene.add(fill);
 // ----------------------------------------------------
 const tiles = new TilesRenderer(TILESET_URL);
 
+if (FORCE_NON_PROXY_CONTENT) {
+  const manager = tiles.manager || tiles.loadingManager;
+  if (manager?.setURLModifier) {
+    manager.setURLModifier((url) => {
+      if (/_proxy\.b3dm$/i.test(url)) {
+        return url.replace(/_proxy\.b3dm$/i, ".b3dm");
+      }
+      return url;
+    });
+  }
+}
+
 tiles.addEventListener?.("tile-load", (e) => {
-  console.log("tile-load", e?.tile?.content?.uri || e?.tile?.contentUrl || e);
+  const loadedUri =
+    e?.url ||
+    e?.tile?.content?.uri ||
+    e?.tile?.contentUrl ||
+    e?.tile?.cached?.uri ||
+    "";
+  if (/_proxy\.b3dm$/i.test(loadedUri)) loadedProxyTiles++;
+  else if (/\.b3dm$/i.test(loadedUri)) loadedFullTiles++;
+
+  console.log("tile-load", loadedUri || e);
+
+  const tileScene = e?.scene || e?.tile?.cached?.scene;
+  if (tileScene) {
+    tileScene.traverse((obj) => {
+      if (!obj.isMesh || !obj.material) return;
+
+      if (!meshOriginalMaterials.has(obj)) {
+        meshOriginalMaterials.set(obj, obj.material);
+      }
+
+      const materials = Array.isArray(obj.material) ? obj.material : [obj.material];
+      for (const material of materials) {
+        if (!material) continue;
+
+        if (material.isMeshStandardMaterial || material.isMeshPhysicalMaterial) {
+          material.envMapIntensity = Math.max(material.envMapIntensity ?? 1.0, 1.0);
+
+          const hasPbrInputs =
+            !!material.map ||
+            !!material.normalMap ||
+            !!material.roughnessMap ||
+            !!material.metalnessMap ||
+            !!material.emissiveMap;
+
+          if (!hasPbrInputs && material.metalness >= 0.95) {
+            material.metalness = 0.1;
+            material.roughness = Math.max(material.roughness ?? 1.0, 0.8);
+          }
+        }
+
+        material.needsUpdate = true;
+      }
+
+      applyDebugMaterialToMesh(obj);
+    });
+  }
 });
 
 tiles.addEventListener?.("tile-error", (e) => {
@@ -90,12 +302,16 @@ tiles.addEventListener?.("load-tileset", () => {
     }
   }
   console.log("tileset loaded");
+
+  if (debugState.showBounds) {
+    updateRootBoundsHelper();
+  }
 });
 
 tiles.setCamera(camera);
 tiles.setResolutionFromRenderer(camera, renderer);
 
-tiles.errorTarget = 64;
+tiles.errorTarget = TARGET_SCREEN_SPACE_ERROR;
 tiles.maxDepth = Infinity;
 
 // Ensure base path is correct
@@ -178,6 +394,380 @@ function frameTileset() {
   return true;
 }
 
+function frameFromSphere(sphere, viewDirection = null) {
+  if (
+    !sphere ||
+    !isFinite(sphere.center.x) ||
+    !isFinite(sphere.center.y) ||
+    !isFinite(sphere.center.z) ||
+    !isFinite(sphere.radius) ||
+    sphere.radius <= 0
+  ) {
+    return false;
+  }
+
+  const viewDir = (viewDirection || new THREE.Vector3(1, 0.6, 1)).clone().normalize();
+  const fov = THREE.MathUtils.degToRad(camera.fov);
+  const fitDist = sphere.radius / Math.sin(fov / 2);
+
+  camera.position
+    .copy(sphere.center)
+    .addScaledVector(viewDir, fitDist * 1.2);
+
+  camera.lookAt(sphere.center);
+
+  camera.near = Math.max(fitDist / 1000, 0.01);
+  camera.far = fitDist * 40.0;
+  camera.updateProjectionMatrix();
+
+  controls.movementSpeed = Math.max(sphere.radius * 0.5, 1.0);
+  return true;
+}
+
+function estimateLoadedGeometrySphere(outSphere) {
+  geometryDebug.meshSeen = 0;
+  geometryDebug.meshWithGeometry = 0;
+  geometryDebug.meshWithPosition = 0;
+  geometryDebug.matrixValid = 0;
+  geometryDebug.matrixInvalid = 0;
+  geometryDebug.sphereValid = 0;
+  geometryDebug.sphereInvalid = 0;
+  geometryDebug.boxValid = 0;
+  geometryDebug.boxInvalid = 0;
+  geometryDebug.attrFallbackUsed = 0;
+  geometryDebug.attrFallbackInvalid = 0;
+  geometryDebug.sampleFinite = 0;
+  geometryDebug.sampleInvalid = 0;
+  geometryDebug.pointFallbackUsed = 0;
+  geometryDebug.totalPositionCount = 0;
+  geometryDebug.totalSamplesTried = 0;
+
+  let hasAnyMeshBounds = false;
+  let hasAnyPointBounds = false;
+  _tmpUnionMin.set(Infinity, Infinity, Infinity);
+  _tmpUnionMax.set(-Infinity, -Infinity, -Infinity);
+
+  tiles.group.updateMatrixWorld(true);
+
+  tiles.group.traverse((obj) => {
+    if (!obj.isMesh) return;
+    geometryDebug.meshSeen++;
+    if (!obj.geometry) return;
+    geometryDebug.meshWithGeometry++;
+
+    const g = obj.geometry;
+    if (g.attributes?.position) {
+      geometryDebug.meshWithPosition++;
+      geometryDebug.totalPositionCount += g.attributes.position.count;
+    }
+
+    const worldMatrix = obj.matrixWorld;
+    let matrixIsFinite = true;
+    for (let i = 0; i < 16; i++) {
+      if (!isFinite(worldMatrix.elements[i])) {
+        matrixIsFinite = false;
+        break;
+      }
+    }
+
+    if (matrixIsFinite) geometryDebug.matrixValid++;
+    else geometryDebug.matrixInvalid++;
+
+    let useSphere = false;
+
+    if (!g.boundingSphere) {
+      g.computeBoundingSphere();
+    }
+    if (g.boundingSphere) {
+      _tmpSphere.copy(g.boundingSphere);
+      if (matrixIsFinite) {
+        _tmpSphere.applyMatrix4(worldMatrix);
+      }
+
+      if (isFinite(_tmpSphere.center.x) && isFinite(_tmpSphere.center.y) && isFinite(_tmpSphere.center.z) && isFinite(_tmpSphere.radius) && _tmpSphere.radius > 0) {
+        useSphere = true;
+        geometryDebug.sphereValid++;
+      } else {
+        geometryDebug.sphereInvalid++;
+      }
+    }
+
+    if (!useSphere) {
+      if (!g.boundingBox) {
+        g.computeBoundingBox();
+      }
+
+      if (g.boundingBox && isFinite(g.boundingBox.min.x) && isFinite(g.boundingBox.max.x)) {
+        _tmpBox.copy(g.boundingBox);
+        if (matrixIsFinite) {
+          _tmpBox.applyMatrix4(worldMatrix);
+        }
+        _tmpBox.getBoundingSphere(_tmpSphere);
+
+        if (isFinite(_tmpSphere.center.x) && isFinite(_tmpSphere.radius) && _tmpSphere.radius > 0) {
+          useSphere = true;
+          geometryDebug.boxValid++;
+        } else {
+          geometryDebug.boxInvalid++;
+        }
+      }
+    }
+
+    if (!useSphere && g.attributes?.position) {
+      const position = g.attributes.position;
+      const count = position.count;
+      const maxSamples = 3000;
+      const step = Math.max(1, Math.ceil(count / maxSamples));
+      let foundFinitePoint = false;
+      let minX = Infinity;
+      let minY = Infinity;
+      let minZ = Infinity;
+      let maxX = -Infinity;
+      let maxY = -Infinity;
+      let maxZ = -Infinity;
+
+      for (let i = 0; i < count; i += step) {
+        geometryDebug.totalSamplesTried++;
+        const x = position.getX(i);
+        const y = position.getY(i);
+        const z = position.itemSize >= 3 ? position.getZ(i) : 0;
+        _tmpMatrixPos.set(x, y, z);
+        if (matrixIsFinite) {
+          _tmpMatrixPos.applyMatrix4(worldMatrix);
+        }
+
+        if (!isFinite(_tmpMatrixPos.x) || !isFinite(_tmpMatrixPos.y) || !isFinite(_tmpMatrixPos.z)) {
+          geometryDebug.sampleInvalid++;
+          continue;
+        }
+
+        geometryDebug.sampleFinite++;
+        foundFinitePoint = true;
+        minX = Math.min(minX, _tmpMatrixPos.x);
+        minY = Math.min(minY, _tmpMatrixPos.y);
+        minZ = Math.min(minZ, _tmpMatrixPos.z);
+        maxX = Math.max(maxX, _tmpMatrixPos.x);
+        maxY = Math.max(maxY, _tmpMatrixPos.y);
+        maxZ = Math.max(maxZ, _tmpMatrixPos.z);
+
+        hasAnyPointBounds = true;
+        _tmpUnionMin.min(_tmpMatrixPos);
+        _tmpUnionMax.max(_tmpMatrixPos);
+      }
+
+      if (foundFinitePoint) {
+        _tmpBox.min.set(minX, minY, minZ);
+        _tmpBox.max.set(maxX, maxY, maxZ);
+        _tmpBox.getBoundingSphere(_tmpSphere);
+
+        if (isFinite(_tmpSphere.center.x) && isFinite(_tmpSphere.radius) && _tmpSphere.radius > 0) {
+          useSphere = true;
+          geometryDebug.attrFallbackUsed++;
+        } else {
+          geometryDebug.attrFallbackInvalid++;
+        }
+      } else {
+        geometryDebug.attrFallbackInvalid++;
+      }
+    }
+
+    if (!useSphere) {
+      return;
+    }
+
+    hasAnyMeshBounds = true;
+    _tmpOffset.set(_tmpSphere.radius, _tmpSphere.radius, _tmpSphere.radius);
+    _tmpUnionMin.min(_tmpCenter.copy(_tmpSphere.center).sub(_tmpOffset));
+    _tmpUnionMax.max(_tmpCenter.copy(_tmpSphere.center).add(_tmpOffset));
+  });
+
+  if (!hasAnyMeshBounds && hasAnyPointBounds) {
+    _tmpBox.min.copy(_tmpUnionMin);
+    _tmpBox.max.copy(_tmpUnionMax);
+    _tmpBox.getBoundingSphere(outSphere);
+
+    if (!isFinite(outSphere.radius) || outSphere.radius <= 0) {
+      _tmpBox.getCenter(outSphere.center);
+      outSphere.radius = 1.0;
+    }
+
+    geometryDebug.pointFallbackUsed = 1;
+    return true;
+  }
+
+  if (!hasAnyMeshBounds) return false;
+
+  _tmpBox.min.copy(_tmpUnionMin);
+  _tmpBox.max.copy(_tmpUnionMax);
+  _tmpBox.getBoundingSphere(outSphere);
+
+  if (!isFinite(outSphere.radius) || outSphere.radius <= 0) {
+    _tmpBox.getCenter(outSphere.center);
+    outSphere.radius = 1.0;
+  }
+
+  return true;
+}
+
+function getMaterialList(materialOrList) {
+  return Array.isArray(materialOrList) ? materialOrList : [materialOrList];
+}
+
+function disposeMaterialList(materialOrList) {
+  for (const material of getMaterialList(materialOrList)) {
+    material?.dispose?.();
+  }
+}
+
+function createDebugMaterial(sourceMaterial) {
+  const side = debugState.doubleSided ? THREE.DoubleSide : sourceMaterial?.side ?? THREE.FrontSide;
+
+  if (debugState.mode === "wireframe") {
+    return new THREE.MeshBasicMaterial({
+      color: 0x7de3ff,
+      wireframe: true,
+      side,
+    });
+  }
+
+  if (debugState.mode === "normals") {
+    return new THREE.MeshNormalMaterial({ side });
+  }
+
+  // Unlit but still uses base map/color so albedo can be inspected without lighting.
+  return new THREE.MeshBasicMaterial({
+    color: sourceMaterial?.color ? sourceMaterial.color.clone() : new THREE.Color(0xdddddd),
+    map: sourceMaterial?.map ?? null,
+    vertexColors: !!sourceMaterial?.vertexColors,
+    side,
+  });
+}
+
+function applyOriginalMaterialSide(material) {
+  if (!material) return;
+
+  if (debugState.doubleSided) {
+    if (!originalMaterialSides.has(material)) {
+      originalMaterialSides.set(material, material.side);
+    }
+    material.side = THREE.DoubleSide;
+    material.needsUpdate = true;
+  } else if (originalMaterialSides.has(material)) {
+    material.side = originalMaterialSides.get(material);
+    originalMaterialSides.delete(material);
+    material.needsUpdate = true;
+  }
+}
+
+function applyDebugMaterialToMesh(mesh) {
+  if (!mesh?.isMesh || !mesh.material) return;
+
+  const originalMaterial = meshOriginalMaterials.get(mesh) ?? mesh.material;
+  if (!meshOriginalMaterials.has(mesh)) {
+    meshOriginalMaterials.set(mesh, originalMaterial);
+  }
+
+  const previousDebugMaterial = meshDebugMaterials.get(mesh);
+  if (previousDebugMaterial) {
+    disposeMaterialList(previousDebugMaterial);
+    meshDebugMaterials.delete(mesh);
+  }
+
+  if (debugState.mode === "original") {
+    mesh.material = originalMaterial;
+    for (const material of getMaterialList(originalMaterial)) {
+      applyOriginalMaterialSide(material);
+    }
+    return;
+  }
+
+  const originalMaterials = getMaterialList(originalMaterial);
+  const debugMaterials = originalMaterials.map((material) => createDebugMaterial(material));
+
+  mesh.material = Array.isArray(originalMaterial) ? debugMaterials : debugMaterials[0];
+  meshDebugMaterials.set(mesh, debugMaterials);
+}
+
+function applyDebugModeToLoadedMeshes() {
+  tiles.group.traverse((obj) => {
+    if (!obj.isMesh || !obj.material) return;
+    applyDebugMaterialToMesh(obj);
+  });
+}
+
+function updateRootBoundsHelper() {
+  if (rootBoundsHelper) {
+    scene.remove(rootBoundsHelper);
+    rootBoundsHelper.geometry?.dispose?.();
+    rootBoundsHelper.material?.dispose?.();
+    rootBoundsHelper = null;
+  }
+
+  if (!debugState.showBounds) return;
+
+  const sphere = getTilesetRootSphere(tiles);
+  if (!sphere || !isFinite(sphere.radius) || sphere.radius <= 0) return;
+
+  rootBoundsHelper = new THREE.Mesh(
+    new THREE.SphereGeometry(sphere.radius, 24, 16),
+    new THREE.MeshBasicMaterial({
+      color: 0xffcc33,
+      wireframe: true,
+      transparent: true,
+      opacity: 0.8,
+      depthTest: false,
+    })
+  );
+  rootBoundsHelper.position.copy(sphere.center);
+  scene.add(rootBoundsHelper);
+}
+
+window.addEventListener("keydown", (event) => {
+  if (event.repeat) return;
+  if (event.target && (event.target.tagName === "INPUT" || event.target.tagName === "TEXTAREA")) {
+    return;
+  }
+
+  switch (event.code) {
+    case "Digit1":
+      debugState.mode = "original";
+      applyDebugModeToLoadedMeshes();
+      break;
+    case "Digit2":
+      debugState.mode = "wireframe";
+      applyDebugModeToLoadedMeshes();
+      break;
+    case "Digit3":
+      debugState.mode = "normals";
+      applyDebugModeToLoadedMeshes();
+      break;
+    case "Digit4":
+      debugState.mode = "unlit";
+      applyDebugModeToLoadedMeshes();
+      break;
+    case "KeyD":
+      debugState.doubleSided = !debugState.doubleSided;
+      applyDebugModeToLoadedMeshes();
+      break;
+    case "KeyB":
+      debugState.showBounds = !debugState.showBounds;
+      updateRootBoundsHelper();
+      break;
+    case "KeyF":
+      needsGeometryRefit = true;
+      console.log(`F_DEBUG ${lastDebugCompactLine || "no-metrics-yet"}`);
+      console.log("F_DEBUG_FRAME", lastFrameStats || {});
+      {
+        const snapshot = collectGeometrySnapshot(12);
+        console.log("F_DEBUG_GEOM", snapshot);
+        updateDebugDump(snapshot);
+      }
+      break;
+    default:
+      return;
+  }
+});
+
 // ----------------------------------------------------
 // Animation loop
 // ----------------------------------------------------
@@ -196,18 +786,76 @@ function animate() {
 
   let meshCount = 0;
   let triCount = 0;
+  let hiddenMeshCount = 0;
+  let blackMaterialCount = 0;
 
   tiles.group.traverse((o) => {
     if (o.isMesh) {
       meshCount++;
 
+      if (!o.visible) {
+        hiddenMeshCount++;
+      }
+
       const g = o.geometry;
       if (g && g.index) triCount += g.index.count / 3;
       else if (g && g.attributes?.position) triCount += g.attributes.position.count / 3;
+
+      if (debugState.mode === "original" && o.material) {
+        for (const material of getMaterialList(o.material)) {
+          if (!material || !material.color) continue;
+          const colorMagnitude = material.color.r + material.color.g + material.color.b;
+          const hasColorMap = !!material.map;
+          if (!hasColorMap && colorMagnitude < 0.12) {
+            blackMaterialCount++;
+          }
+        }
+      }
     }
   });
 
-  hud.textContent = "Loaded tileset — WASD/RF to fly, mouse drag to look \n" + `meshes=${meshCount} tris≈${Math.floor(triCount)}`;
+  const hasGeometrySphere = estimateLoadedGeometrySphere(_tmpWorldSphere);
+
+  if (hasGeometrySphere && (!didFrameFromGeometry || needsGeometryRefit)) {
+    const framed = frameFromSphere(_tmpWorldSphere);
+    if (framed) {
+      didFrameFromGeometry = true;
+      needsGeometryRefit = false;
+    }
+  }
+
+  const cameraToGeom = hasGeometrySphere
+    ? camera.position.distanceTo(_tmpWorldSphere.center)
+    : NaN;
+  const geomRadius = hasGeometrySphere ? _tmpWorldSphere.radius : NaN;
+
+  const debugCompact =
+    `m=${geometryDebug.meshSeen}/${geometryDebug.meshWithGeometry}/${geometryDebug.meshWithPosition} ` +
+    `mw=${geometryDebug.matrixValid}-${geometryDebug.matrixInvalid} ` +
+    `s=${geometryDebug.sphereValid}-${geometryDebug.sphereInvalid} ` +
+    `b=${geometryDebug.boxValid}-${geometryDebug.boxInvalid} ` +
+    `a=${geometryDebug.attrFallbackUsed}-${geometryDebug.attrFallbackInvalid} ` +
+    `p=${geometryDebug.sampleFinite}-${geometryDebug.sampleInvalid} ` +
+    `pt=${geometryDebug.totalPositionCount}/${geometryDebug.totalSamplesTried} ` +
+    `u=${loadedFullTiles}/${loadedProxyTiles} ` +
+    `pf=${geometryDebug.pointFallbackUsed}`;
+  lastDebugCompactLine =
+    `geomRadius=${isFinite(geomRadius) ? geomRadius.toFixed(2) : "n/a"} ` +
+    `camDist=${isFinite(cameraToGeom) ? cameraToGeom.toFixed(2) : "n/a"} ` +
+    debugCompact;
+  lastFrameStats = {
+    geomRadius,
+    cameraToGeom,
+    debugCompact,
+  };
+
+  hud.textContent =
+    "Loaded tileset — WASD/RF to fly, mouse drag to look\n" +
+    `mode=${debugState.mode} | doubleSided=${debugState.doubleSided ? "on" : "off"} | bounds=${debugState.showBounds ? "on" : "off"}\n` +
+    `meshes=${meshCount} hidden=${hiddenMeshCount} tris~${Math.floor(triCount)} darkMats~${blackMaterialCount}\n` +
+    `geomRadius~${isFinite(geomRadius) ? geomRadius.toFixed(2) : "n/a"} camDist~${isFinite(cameraToGeom) ? cameraToGeom.toFixed(2) : "n/a"}\n` +
+    `${debugCompact}\n` +
+    "keys: 1=original 2=wireframe 3=normals 4=unlit D=double-sided B=bounds F=frame";
 
   //updateGeometryBounds();
 }

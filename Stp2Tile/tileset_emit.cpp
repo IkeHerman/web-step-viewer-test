@@ -5,9 +5,14 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <iostream>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 #include <vector>
+#include <cstdint>
+#include <system_error>
+#include <cmath>
 
 #include <Bnd_Box.hxx>
 #include <Message_ProgressRange.hxx>
@@ -28,15 +33,33 @@ namespace
     static double MaxSideLength(const Bnd_Box& b)
     {
         if (b.IsVoid())
+        {
             return 0.0;
+        }
 
         double xmin, ymin, zmin, xmax, ymax, zmax;
         GetMinMax(b, xmin, ymin, zmin, xmax, ymax, zmax);
 
-        double sx = xmax - xmin;
-        double sy = ymax - ymin;
-        double sz = zmax - zmin;
+        const double sx = xmax - xmin;
+        const double sy = ymax - ymin;
+        const double sz = zmax - zmin;
         return std::max(sx, std::max(sy, sz));
+    }
+
+    static double DiagonalLength(const Bnd_Box& b)
+    {
+        if (b.IsVoid())
+        {
+            return 0.0;
+        }
+
+        double xmin, ymin, zmin, xmax, ymax, zmax;
+        GetMinMax(b, xmin, ymin, zmin, xmax, ymax, zmax);
+
+        const double dx = xmax - xmin;
+        const double dy = ymax - ymin;
+        const double dz = zmax - zmin;
+        return std::sqrt(dx * dx + dy * dy + dz * dz);
     }
 
     static gp_Pnt ToGltfSpace(const gp_Pnt& p)
@@ -54,22 +77,20 @@ namespace
         double xmin, ymin, zmin, xmax, ymax, zmax;
         GetMinMax(b, xmin, ymin, zmin, xmax, ymax, zmax);
 
-        // Center + half-lengths in OCCT space
         gp_Pnt cOcct(
             (xmin + xmax) * 0.5,
             (ymin + ymax) * 0.5,
             (zmin + zmax) * 0.5
         );
 
-        double hxLen = (xmax - xmin) * 0.5;
-        double hyLen = (ymax - ymin) * 0.5;
-        double hzLen = (zmax - zmin) * 0.5;
+        const double hxLen = (xmax - xmin) * 0.5;
+        const double hyLen = (ymax - ymin) * 0.5;
+        const double hzLen = (zmax - zmin) * 0.5;
 
         gp_Vec hxOcct(hxLen, 0.0, 0.0);
         gp_Vec hyOcct(0.0, hyLen, 0.0);
         gp_Vec hzOcct(0.0, 0.0, hzLen);
 
-        // Convert into glTF space (must match your RWGltf_CafWriter axis conversion)
         gp_Pnt c = ToGltfSpace(cOcct);
         gp_Vec hx = ToGltfSpace(hxOcct);
         gp_Vec hy = ToGltfSpace(hyOcct);
@@ -85,30 +106,164 @@ namespace
 
     static double GeometricErrorFromBoundsHeuristic(const Bnd_Box& b)
     {
-        double size = MaxSideLength(b); // full length of the largest side
+        const double size = MaxSideLength(b);
         if (size <= 0.0)
+        {
             return 0.0;
+        }
 
         return size / 16.0;
     }
-
 
     static bool HasAnyChild(const TileOctree::Node& node)
     {
         for (const auto& c : node.children)
         {
-            if (c) return true;
+            if (c)
+            {
+                return true;
+            }
         }
         return false;
     }
 
-    static void CollectSubtreeItems(const TileOctree::Node& node, std::vector<std::uint32_t>& out)
+    static bool IsFinite(double v)
     {
-        out.insert(out.end(), node.items.begin(), node.items.end());
+        return std::isfinite(v);
+    }
+
+    static bool ValidateBounds(const Bnd_Box& b, bool expectNonEmpty, const std::string& label)
+    {
+        if (b.IsVoid())
+        {
+            if (expectNonEmpty)
+            {
+                std::cout << "[TilesetEmit] invalid bounds (void) for " << label << "\n";
+                return false;
+            }
+            return true;
+        }
+
+        double xmin, ymin, zmin, xmax, ymax, zmax;
+        GetMinMax(b, xmin, ymin, zmin, xmax, ymax, zmax);
+
+        if (!IsFinite(xmin) || !IsFinite(ymin) || !IsFinite(zmin) ||
+            !IsFinite(xmax) || !IsFinite(ymax) || !IsFinite(zmax))
+        {
+            std::cout << "[TilesetEmit] invalid bounds (non-finite) for " << label << "\n";
+            return false;
+        }
+
+        const double dx = xmax - xmin;
+        const double dy = ymax - ymin;
+        const double dz = zmax - zmin;
+        const double radius = 0.5 * std::sqrt(dx * dx + dy * dy + dz * dz);
+
+        if (expectNonEmpty && radius <= 1e-9)
+        {
+            std::cout << "[TilesetEmit] invalid bounds (radius too small) for " << label
+                      << ", radius=" << radius << "\n";
+            return false;
+        }
+
+        return true;
+    }
+
+    static bool ValidateTileGeometryStats(
+        const glbopt::Stats& stats,
+        bool expectNonEmpty,
+        const std::string& label)
+    {
+        if (!expectNonEmpty)
+        {
+            return true;
+        }
+
+        if (stats.PrimitiveCountMergedOut == 0)
+        {
+            std::cout << "[TilesetEmit] rejected " << label
+                      << ": no merged primitives were emitted\n";
+            return false;
+        }
+
+        if (stats.OutputVertexCount < 3)
+        {
+            std::cout << "[TilesetEmit] rejected " << label
+                      << ": output vertex count too small (" << stats.OutputVertexCount << ")\n";
+            return false;
+        }
+
+        if (stats.OutputPrimitiveElementCount < 3)
+        {
+            std::cout << "[TilesetEmit] rejected " << label
+                      << ": output index count too small (" << stats.OutputPrimitiveElementCount << ")\n";
+            return false;
+        }
+
+        if ((stats.OutputPrimitiveElementCount % 3u) != 0u)
+        {
+            std::cout << "[TilesetEmit] rejected " << label
+                      << ": output index count is not triangle-aligned ("
+                      << stats.OutputPrimitiveElementCount << ")\n";
+            return false;
+        }
+
+        return true;
+    }
+
+    static bool ValidateProxyReduction(
+        const glbopt::Stats& stats,
+        bool expectNonEmpty,
+        const std::string& label)
+    {
+        if (!expectNonEmpty || stats.InputVertexCount == 0)
+        {
+            return true;
+        }
+
+        const double ratio =
+            static_cast<double>(stats.OutputVertexCount) /
+            static_cast<double>(stats.InputVertexCount);
+
+        if (ratio <= 1e-4)
+        {
+            std::cout << "[TilesetEmit] rejected " << label
+                      << ": proxy collapsed too aggressively (vertex ratio=" << ratio << ")\n";
+            return false;
+        }
+
+        return true;
+    }
+
+    static void AccumulateTightBounds(
+        const TileOctree::Node& node,
+        const std::vector<Occurrence>& occs,
+        Bnd_Box& out)
+    {
+        for (std::uint32_t idx : node.items)
+        {
+            if (idx >= occs.size())
+            {
+                continue;
+            }
+
+            const Bnd_Box& ob = occs[static_cast<std::size_t>(idx)].WorldBounds;
+            if (ob.IsVoid())
+            {
+                continue;
+            }
+
+            out.Add(ob);
+        }
+
         for (const auto& c : node.children)
         {
-            if (!c) continue;
-            CollectSubtreeItems(*c, out);
+            if (!c)
+            {
+                continue;
+            }
+
+            AccumulateTightBounds(*c, occs, out);
         }
     }
 
@@ -116,219 +271,530 @@ namespace
     {
         Bnd_Box b;
         b.SetVoid();
+        AccumulateTightBounds(node, occs, b);
 
-        std::vector<std::uint32_t> all;
-        all.reserve(node.items.size());
-        CollectSubtreeItems(node, all);
-
-        for (std::uint32_t idx : all)
-        {
-            if (idx >= occs.size()) continue;
-            const Bnd_Box& ob = occs[static_cast<std::size_t>(idx)].WorldBounds;
-            if (ob.IsVoid()) continue;
-            b.Add(ob);
-        }
         return b;
     }
 
     static std::string JoinUri(const std::string& subdir, const std::string& name)
     {
         if (subdir.empty())
+        {
             return name;
+        }
+
         if (subdir.back() == '/' || subdir.back() == '\\')
+        {
             return subdir + name;
+        }
+
         return subdir + "/" + name;
     }
 
     static void Indent(std::ostringstream& ss, int depth)
     {
-        for (int i = 0; i < depth; ++i) ss << "  ";
+        for (int i = 0; i < depth; ++i)
+        {
+            ss << "  ";
+        }
     }
 
-    struct EmitState
+    static int ComputeMaxDepth(const TileOctree::Node& node)
     {
-        std::uint32_t nextNodeId = 0;
+        int maxChildDepth = 0;
 
-        // Optional debugging: map tileId -> occurrence indices
-        std::ostringstream manifest; // writes a JSON array
-        bool manifestStarted = false;
+        for (const auto& childPtr : node.children)
+        {
+            if (!childPtr)
+            {
+                continue;
+            }
+
+            const int childDepth = ComputeMaxDepth(*childPtr);
+            if (childDepth > maxChildDepth)
+            {
+                maxChildDepth = childDepth;
+            }
+        }
+
+        return 1 + maxChildDepth;
+    }
+
+    static float Clamp01(float v)
+    {
+        if (v < 0.0f)
+        {
+            return 0.0f;
+        }
+
+        if (v > 1.0f)
+        {
+            return 1.0f;
+        }
+
+        return v;
+    }
+
+    // SSE-inspired importance:
+    // 1. Larger nodes relative to root stay less aggressive.
+    // 2. Deeper nodes get somewhat more aggressive.
+    // 3. We use this only to choose bake-time proxy settings.
+    static float ComputeNodeImportance(
+        const Bnd_Box& nodeBounds,
+        const Bnd_Box& rootBounds,
+        int depthFromRoot,
+        int maxDepth)
+    {
+        const double rootDiag = std::max(1e-9, DiagonalLength(rootBounds));
+        const double nodeDiag = std::max(0.0, DiagonalLength(nodeBounds));
+
+        const float relativeSize =
+            Clamp01(static_cast<float>(nodeDiag / rootDiag));
+
+        const float normalizedDepth =
+            Clamp01(static_cast<float>(depthFromRoot) /
+                    static_cast<float>(std::max(1, maxDepth)));
+
+        // Weight size more heavily than depth:
+        // big nodes matter even if deep; tiny nodes can be very aggressive.
+        const float importance =
+            Clamp01(relativeSize * 0.75f + (1.0f - normalizedDepth) * 0.25f);
+
+        return importance;
+    }
+
+    static glbopt::Options BuildProxyGlbOptOptionsForImportance(float importance)
+    {
+        glbopt::Options options;
+
+        // Keep proxy reduction deterministic; avoid cross-material collapsing.
+        options.DeduplicateMaterials = false;
+
+        // Keep position welding enabled for proxies to avoid ballooning duplicated
+        // vertices across merged child content.
+        options.WeldPositions = true;
+        options.WeldNormals = false;
+        options.WeldTexcoord0 = false;
+        options.WeldColor0 = false;
+        // Preserve source vertex colors in proxy tiles. Some CAD exports rely on
+        // COLOR_0 when explicit glTF material bindings are sparse or missing.
+        options.DropAllBlackColor0 = false;
+        options.StripColor0Always = false;
+        options.ForceDefaultMaterialForMissing = true;
+
+        options.RemoveDegenerateByIndex = true;
+        options.RemoveDegenerateByArea = true;
+
+        options.OptimizeVertexCache = true;
+        options.OptimizeOverdraw = false;
+        options.OptimizeVertexFetch = true;
+
+        options.PositionStep = 0.00001f;
+        options.NormalStep   = 0.001f;
+        options.TexcoordStep = 0.0001f;
+        options.ColorStep    = 1.0f / 255.0f;
+
+        options.DegenerateAreaEpsilonSq = 1e-20f;
+        options.Simplify = true;
+        options.SimplifyRatio = 0.05f + 0.20f * Clamp01(importance);
+        options.SimplifyError = 1e-2f;
+        options.OverdrawThreshold = 1.05f;
+
+        return options;
+    }
+
+    static glbopt::Options BuildLeafGlbOptOptions()
+    {
+        glbopt::Options options;
+
+        options.DeduplicateMaterials = false;
+
+        options.WeldPositions = true;
+        options.WeldNormals = true;
+        options.WeldTexcoord0 = true;
+        options.WeldColor0 = true;
+
+        // Keep leaf weld conservative to reduce risk of topology damage.
+        options.PositionStep = 0.00001f;
+        options.NormalStep = 0.001f;
+        options.TexcoordStep = 0.0001f;
+        options.ColorStep = 1.0f / 255.0f;
+
+        options.RemoveDegenerateByIndex = true;
+        options.RemoveDegenerateByArea = true;
+
+        options.Simplify = false;
+
+        options.OptimizeVertexCache = true;
+        options.OptimizeOverdraw = false;
+        options.OptimizeVertexFetch = true;
+
+        return options;
+    }
+
+    struct BakedNodeArtifact
+    {
+        std::uint32_t nodeId = 0;
+        bool isLeaf = false;
+        Bnd_Box bounds;
+        std::filesystem::path GlbPath;
+        std::string ContentUri;
     };
 
-    static void ManifestBegin(EmitState& st)
+    struct BakeState
     {
-        if (st.manifestStarted) return;
-        st.manifestStarted = true;
-        st.manifest << "[\n";
-    }
+        std::uint32_t nextNodeId = 0;
+        std::unordered_map<const TileOctree::Node*, BakedNodeArtifact> artifacts;
+    };
 
-    static void ManifestAdd(EmitState& st, std::uint32_t nodeId, const std::vector<std::uint32_t>& items)
-    {
-        ManifestBegin(st);
-
-        st.manifest << "  {\"tileId\":" << nodeId << ",\"occurrenceIndices\":[";
-        for (std::size_t i = 0; i < items.size(); ++i)
-        {
-            if (i) st.manifest << ",";
-            st.manifest << items[i];
-        }
-        st.manifest << "]}";
-        st.manifest << ",\n";
-    }
-
-    static void ManifestEnd(EmitState& st)
-    {
-        if (!st.manifestStarted) return;
-
-        std::string s = st.manifest.str();
-        // Remove trailing ",\n" if present
-        if (s.size() >= 2)
-        {
-            if (s.rfind(",\n") == s.size() - 2)
-            {
-                s.erase(s.size() - 2);
-            }
-        }
-        st.manifest.str("");
-        st.manifest.clear();
-        st.manifest << s << "\n]\n";
-    }
-
-
-
-    static void EmitTileNode(
-        std::ostringstream& ss,
+    static bool BakeLeafArtifacts(
         const TileOctree::Node& node,
-        const Handle(XCAFDoc_ShapeTool)& sourceShapeTool,
         const std::vector<Occurrence>& occurrences,
         const TilesetEmit::Options& opt,
-        EmitState& st,
-        int depth)
+        BakedNodeArtifact& artifact)
     {
-        const std::uint32_t nodeId = st.nextNodeId++;
+        const std::string baseName = opt.tileFilePrefix + std::to_string(artifact.nodeId);
+        const std::filesystem::path tilesDir =
+            std::filesystem::path(opt.tilesetOutDir) / opt.contentSubdir;
 
-        const bool isLeaf = !HasAnyChild(node);
+        std::filesystem::create_directories(tilesDir);
 
-        // Content policy
-        const bool isEmptyTile = node.items.empty();
+        const std::filesystem::path rawFullGlbPath = tilesDir / (baseName + "_raw.glb");
+        const std::filesystem::path fullGlbPath = tilesDir / (baseName + ".glb");
+        const std::filesystem::path fullB3dmPath = tilesDir / (baseName + ".b3dm");
 
-        bool shouldWriteContent = !isEmptyTile;
-        if (opt.contentOnlyAtLeaves && !isLeaf)
-            shouldWriteContent = false;
+        const bool okRaw = ExportTileToGlbFile(
+            occurrences,
+            node.items,
+            rawFullGlbPath.string(),
+            0.0f,
+            opt.debugAppearance);
 
-        // Override: empty tiles should still write placeholder cube content
-        if (isEmptyTile)
-            shouldWriteContent = true;
+        if (!okRaw)
+        {
+            return false;
+        }
 
-        // Bounding volume
-        Bnd_Box bv = node.volume;
+        const glbopt::Options leafGlbOptions = BuildLeafGlbOptOptions();
+        glbopt::Stats leafGlbStats;
+        const bool okOptimize =
+            glbopt::OptimizeGlbFile(
+                rawFullGlbPath.string(),
+                fullGlbPath.string(),
+                leafGlbOptions,
+                leafGlbStats);
+
+        if (!okOptimize)
+        {
+            return false;
+        }
+
+        const bool expectNonEmpty = node.totalTriangles > 0;
+        if (!ValidateTileGeometryStats(leafGlbStats, expectNonEmpty, baseName))
+        {
+            return false;
+        }
+
+        if (opt.debugAppearance)
+        {
+            const std::size_t trisIn = leafGlbStats.InputPrimitiveElementCount / 3u;
+            const std::size_t trisOut = leafGlbStats.OutputPrimitiveElementCount / 3u;
+
+            std::cout << "[LeafGlbOpt] tile=" << baseName
+                      << " vertsIn=" << leafGlbStats.InputVertexCount
+                      << " vertsOut=" << leafGlbStats.OutputVertexCount
+                      << " vertsMerged=" << leafGlbStats.MergedVertexCount
+                      << " trisIn=" << trisIn
+                      << " trisOut=" << trisOut
+                      << " matsIn=" << leafGlbStats.MaterialCountInput
+                      << " matsCanon=" << leafGlbStats.MaterialCountCanonical
+                      << " matRemap=" << leafGlbStats.MaterialSlotsRemapped
+                      << " primIn=" << leafGlbStats.PrimitiveCountExtracted
+                      << " primOut=" << leafGlbStats.PrimitiveCountMergedOut
+                      << "\n";
+        }
+
+        const bool okB3dm =
+            B3dm::WrapGlbFileToB3dmFile(fullGlbPath.string(), fullB3dmPath.string());
+
+        if (!okB3dm)
+        {
+            return false;
+        }
+
+        artifact.GlbPath = fullGlbPath;
+        artifact.ContentUri = JoinUri(opt.contentSubdir, baseName + ".b3dm");
+
+        if (!opt.keepGlbFilesForDebug)
+        {
+            std::error_code ec;
+            std::filesystem::remove(rawFullGlbPath, ec);
+        }
+
+        return true;
+    }
+
+    static bool BakeInternalProxyArtifact(
+        const TileOctree::Node& node,
+        const TilesetEmit::Options& opt,
+        BakedNodeArtifact& artifact,
+        const BakeState& bakeState,
+        int depthFromRoot,
+        int maxDepth,
+        const Bnd_Box& rootBounds)
+    {
+        std::vector<std::string> childGlbPaths;
+        childGlbPaths.reserve(8);
+
+        for (const auto& childPtr : node.children)
+        {
+            if (!childPtr)
+            {
+                continue;
+            }
+
+            const TileOctree::Node* child = childPtr.get();
+            std::unordered_map<const TileOctree::Node*, BakedNodeArtifact>::const_iterator it =
+                bakeState.artifacts.find(child);
+
+            if (it == bakeState.artifacts.end())
+            {
+                continue;
+            }
+
+            if (!it->second.GlbPath.empty())
+            {
+                childGlbPaths.push_back(it->second.GlbPath.string());
+            }
+        }
+
+        if (childGlbPaths.empty())
+        {
+            artifact.GlbPath.clear();
+            artifact.ContentUri.clear();
+            return true;
+        }
+
+        const std::string baseName = opt.tileFilePrefix + std::to_string(artifact.nodeId);
+        const std::filesystem::path tilesDir =
+            std::filesystem::path(opt.tilesetOutDir) / opt.contentSubdir;
+
+        std::filesystem::create_directories(tilesDir);
+
+        const std::filesystem::path proxyGlbPath = tilesDir / (baseName + "_proxy.glb");
+        const std::filesystem::path proxyB3dmPath = tilesDir / (baseName + "_proxy.b3dm");
+
+        const float importance = ComputeNodeImportance(
+            artifact.bounds,
+            rootBounds,
+            depthFromRoot,
+            maxDepth);
+
+        const glbopt::Options glbOptions =
+            BuildProxyGlbOptOptionsForImportance(importance);
+
+        glbopt::Stats proxyStats;
+
+        const bool okProxyBake =
+            glbopt::OptimizeGlbFiles(childGlbPaths, proxyGlbPath.string(), glbOptions, proxyStats);
+
+        if (!okProxyBake)
+        {
+            return false;
+        }
+
+        if (opt.debugAppearance)
+        {
+            const std::size_t trisIn = proxyStats.InputPrimitiveElementCount / 3u;
+            const std::size_t trisOut = proxyStats.OutputPrimitiveElementCount / 3u;
+
+            std::cout << "[ProxyGlbOpt] tile=" << baseName
+                      << " importance=" << importance
+                      << " simplifyRatio=" << glbOptions.SimplifyRatio
+                      << " vertsIn=" << proxyStats.InputVertexCount
+                      << " vertsOut=" << proxyStats.OutputVertexCount
+                      << " trisIn=" << trisIn
+                      << " trisOut=" << trisOut
+                      << " primIn=" << proxyStats.PrimitiveCountExtracted
+                      << " primOut=" << proxyStats.PrimitiveCountMergedOut
+                      << "\n";
+        }
+
+        const bool expectNonEmpty = node.totalTriangles > 0;
+        const bool geometryOk =
+            ValidateTileGeometryStats(proxyStats, expectNonEmpty, baseName + "_proxy");
+        const bool reductionOk =
+            ValidateProxyReduction(proxyStats, expectNonEmpty, baseName + "_proxy");
+
+        if (!geometryOk || !reductionOk)
+        {
+            return false;
+        }
+
+        const bool okProxyB3dm =
+            B3dm::WrapGlbFileToB3dmFile(proxyGlbPath.string(), proxyB3dmPath.string());
+
+        if (!okProxyB3dm)
+        {
+            return false;
+        }
+
+        artifact.GlbPath = proxyGlbPath;
+        artifact.ContentUri = JoinUri(opt.contentSubdir, baseName + "_proxy.b3dm");
+
+        if (!opt.keepGlbFilesForDebug)
+        {
+            std::error_code ec;
+            std::filesystem::remove(proxyGlbPath, ec);
+        }
+
+        return true;
+    }
+
+    static bool BakeArtifactsBottomUp(
+        const TileOctree::Node& node,
+        const std::vector<Occurrence>& occurrences,
+        const TilesetEmit::Options& opt,
+        BakeState& bakeState,
+        int depthFromRoot,
+        int maxDepth,
+        const Bnd_Box& rootBounds)
+    {
+        for (const auto& childPtr : node.children)
+        {
+            if (!childPtr)
+            {
+                continue;
+            }
+
+            if (!BakeArtifactsBottomUp(
+                    *childPtr,
+                    occurrences,
+                    opt,
+                    bakeState,
+                    depthFromRoot + 1,
+                    maxDepth,
+                    rootBounds))
+            {
+                return false;
+            }
+        }
+
+        BakedNodeArtifact artifact;
+        artifact.nodeId = bakeState.nextNodeId++;
+        artifact.isLeaf = !HasAnyChild(node);
+        artifact.bounds = node.volume;
+
         if (opt.useTightBounds)
         {
-            Bnd_Box tight = ComputeTightBounds(node, occurrences);
+            const Bnd_Box tight = ComputeTightBounds(node, occurrences);
             if (!tight.IsVoid())
-                bv = tight;
+            {
+                artifact.bounds = tight;
+            }
         }
 
-        // Export content now (so nodeId matches file name)
-        std::string contentUri;
-        if (shouldWriteContent)
         {
-            const std::string fileName = opt.tileFilePrefix + std::to_string(nodeId);
-
-            const std::filesystem::path tilesDir = std::filesystem::path(opt.tilesetOutDir) / opt.contentSubdir;
-            std::filesystem::create_directories(tilesDir);
-
-            const std::filesystem::path glbPath = tilesDir / (fileName + ".glb");
-            const std::filesystem::path glbRawPath = tilesDir / (fileName + "_raw.glb");
-            const std::filesystem::path b3dmPath = tilesDir / (fileName + ".b3dm");
-
-
-            bool okGlb = false;
-
-            if (!isEmptyTile)
+            const std::string tileLabel = opt.tileFilePrefix + std::to_string(artifact.nodeId);
+            const bool expectNonEmpty = node.totalTriangles > 0;
+            if (!ValidateBounds(artifact.bounds, expectNonEmpty, tileLabel))
             {
-                okGlb = ExportTileToGlbFile(sourceShapeTool, occurrences, node.items, glbRawPath.string(),0.0f);
-
-                GlbOpt::Options opt;
-        
-                opt.maxTriangleCountTotal = 0; 
-                opt.verbose = true;
-
-                GlbOpt::GlbOptimize(glbRawPath.string(), glbPath.string(), opt);
-            }
-            else
-            {
-                std::vector<std::uint32_t> allItems; 
-                
-                CollectSubtreeItems(node, allItems);
-                
-                okGlb = ExportTileToGlbFile(sourceShapeTool, occurrences, allItems, glbRawPath.string(),1.0f);
-
-                GlbOpt::Options opt;
-        
-                opt.maxTriangleCountTotal = 0; 
-                opt.verbose = true;
-
-                GlbOpt::GlbOptimize(glbRawPath.string(), glbPath.string(), opt);
-//                okGlb = ExportBoxToGlbFile(bv, glbPath.string());
-            }
-
-            if (okGlb)
-            {
-                bool okB3dm = B3dm::WrapGlbFileToB3dmFile(glbPath.string(), b3dmPath.string());
-                if (okB3dm)
-                {
-                    contentUri = JoinUri(opt.contentSubdir, fileName + ".b3dm");
-
-                    if (!opt.keepGlbFilesForDebug)
-                    {
-                        std::error_code ec;
-                        std::filesystem::remove(glbPath, ec);
-                    }
-
-                    // Debug manifest only for real content tiles (optional)
-                    if (!isEmptyTile)
-                    {
-                        ManifestAdd(st, nodeId, node.items);
-                    }
-                }
+                return false;
             }
         }
 
-        // Emit JSON node
+        bool ok = false;
+        if (artifact.isLeaf)
+        {
+            ok = BakeLeafArtifacts(node, occurrences, opt, artifact);
+        }
+        else
+        {
+            ok = BakeInternalProxyArtifact(
+                node,
+                opt,
+                artifact,
+                bakeState,
+                depthFromRoot,
+                maxDepth,
+                rootBounds);
+        }
+
+        if (!ok)
+        {
+            return false;
+        }
+
+        bakeState.artifacts[&node] = artifact;
+        return true;
+    }
+
+    static void EmitJsonNode(
+        std::ostringstream& ss,
+        const TileOctree::Node& node,
+        const BakeState& bakeState,
+        int depth,
+        double parentGeometricError,
+        bool isRoot)
+    {
+        std::unordered_map<const TileOctree::Node*, BakedNodeArtifact>::const_iterator it =
+            bakeState.artifacts.find(&node);
+
+        if (it == bakeState.artifacts.end())
+        {
+            return;
+        }
+
+        const BakedNodeArtifact& artifact = it->second;
+
         Indent(ss, depth);
         ss << "{\n";
 
         Indent(ss, depth + 1);
         ss << "\"boundingVolume\":{\"box\":[";
-        std::array<double, 12> box = ToTilesBoxGltfSpace(bv);
+        const std::array<double, 12> box = ToTilesBoxGltfSpace(artifact.bounds);
         for (int i = 0; i < 12; ++i)
         {
-            if (i) ss << ",";
+            if (i)
+            {
+                ss << ",";
+            }
             ss << std::setprecision(15) << box[static_cast<std::size_t>(i)];
         }
         ss << "]}," << "\n";
 
         Indent(ss, depth + 1);
-        double geometricError = isLeaf ? 0 : GeometricErrorFromBoundsHeuristic(bv);
+        double geometricError = 0.0;
+        if (!artifact.isLeaf)
+        {
+            geometricError = GeometricErrorFromBoundsHeuristic(artifact.bounds);
+            if (!isRoot && parentGeometricError > 0.0)
+            {
+                const double maxAllowed = parentGeometricError * 0.5;
+                geometricError = std::min(geometricError, maxAllowed);
+            }
+        }
+
         ss << "\"geometricError\":" << std::setprecision(15) << geometricError << ",\n";
 
         Indent(ss, depth + 1);
-        const char* refineMode = "REPLACE";
-        ss << "\"refine\":\"" << refineMode << "\"";
+        ss << "\"refine\":\"REPLACE\"";
 
-        if (!contentUri.empty())
+        if (!artifact.ContentUri.empty())
         {
             ss << ",\n";
             Indent(ss, depth + 1);
-            ss << "\"content\":{\"uri\":\"" << contentUri << "\"}";
+            ss << "\"content\":{\"uri\":\"" << artifact.ContentUri << "\"}";
         }
 
-        // Children
         std::vector<const TileOctree::Node*> children;
         children.reserve(8);
-        for (const auto& c : node.children)
+        for (const auto& childPtr : node.children)
         {
-            if (c) children.push_back(c.get());
+            if (childPtr)
+            {
+                children.push_back(childPtr.get());
+            }
         }
 
         if (!children.empty())
@@ -339,8 +805,11 @@ namespace
 
             for (std::size_t i = 0; i < children.size(); ++i)
             {
-                EmitTileNode(ss, *children[i], sourceShapeTool, occurrences, opt, st, depth + 2);
-                if (i + 1 < children.size()) ss << ",";
+                EmitJsonNode(ss, *children[i], bakeState, depth + 2, geometricError, false);
+                if (i + 1 < children.size())
+                {
+                    ss << ",";
+                }
                 ss << "\n";
             }
 
@@ -358,52 +827,58 @@ namespace TilesetEmit
 {
     bool EmitTilesetAndB3dm(
         const TileOctree& tree,
-        const Handle(XCAFDoc_ShapeTool)& sourceShapeTool,
         const std::vector<Occurrence>& occurrences,
         const Options& opt)
     {
         std::filesystem::create_directories(opt.tilesetOutDir);
 
-        Bnd_Box rootBv = tree.Root().volume;
-        if (opt.useTightBounds)
+        const int maxDepth = ComputeMaxDepth(tree.Root());
+        const Bnd_Box rootBounds = tree.Root().volume;
+
+        BakeState bakeState;
+        if (!BakeArtifactsBottomUp(
+                tree.Root(),
+                occurrences,
+                opt,
+                bakeState,
+                0,
+                maxDepth,
+                rootBounds))
         {
-            Bnd_Box tight = ComputeTightBounds(tree.Root(), occurrences);
-            if (!tight.IsVoid())
-                rootBv = tight;
+            return false;
         }
 
-        EmitState st;
+        std::unordered_map<const TileOctree::Node*, BakedNodeArtifact>::const_iterator rootIt =
+            bakeState.artifacts.find(&tree.Root());
+
+        if (rootIt == bakeState.artifacts.end())
+        {
+            return false;
+        }
+
+        const double rootGeometricError =
+            GeometricErrorFromBoundsHeuristic(rootIt->second.bounds);
+
         std::ostringstream ss;
-
-        const double rootGeometricError = GeometricErrorFromBoundsHeuristic(rootBv);
-
         ss << "{\n";
         ss << "  \"asset\":{\"version\":\"1.0\"},\n";
         ss << "  \"geometricError\":" << std::setprecision(15) << rootGeometricError << ",\n";
         ss << "  \"root\":\n";
 
-        EmitTileNode(ss, tree.Root(), sourceShapeTool, occurrences, opt, st, 2);
+        EmitJsonNode(ss, tree.Root(), bakeState, 2, rootGeometricError, true);
 
         ss << "\n}\n";
 
-        // Write tileset.json
+        const std::filesystem::path tilesetPath =
+            std::filesystem::path(opt.tilesetOutDir) / "tileset.json";
+
+        std::ofstream f(tilesetPath);
+        if (!f)
         {
-            const std::filesystem::path tilesetPath = std::filesystem::path(opt.tilesetOutDir) / "tileset.json";
-            std::ofstream f(tilesetPath);
-            if (!f) return false;
-            f << ss.str();
+            return false;
         }
 
-        // Write optional manifest (helps you confirm “which occurrences in which tile”)
-        ManifestEnd(st);
-        if (st.manifestStarted)
-        {
-            const std::filesystem::path manifestPath = std::filesystem::path(opt.tilesetOutDir) / "tile_manifest.json";
-            std::ofstream mf(manifestPath);
-            if (mf)
-                mf << st.manifest.str();
-        }
-
+        f << ss.str();
         return true;
     }
 }
