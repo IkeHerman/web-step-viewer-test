@@ -8,7 +8,7 @@ import { TilesRenderer } from "3d-tiles-renderer";
 // ----------------------------------------------------
 const TILESET_URL = "/tileset.json";
 const FORCE_NON_PROXY_CONTENT = false;
-const TARGET_SCREEN_SPACE_ERROR = 14.0;
+const TARGET_SCREEN_SPACE_ERROR = 80.0;
 const MAX_TILE_DEPTH = 6;
 const INITIAL_AXIS_FIX = "flip-x-180"; // none | flip-x-180 | z-up-to-y-up
 

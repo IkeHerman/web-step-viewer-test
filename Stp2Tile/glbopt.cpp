@@ -31,6 +31,49 @@ namespace glbopt
                 material.doubleSided = true;
             }
         }
+
+        bool MaterialUsesAnyTexture(const tinygltf::Material& material)
+        {
+            if (material.pbrMetallicRoughness.baseColorTexture.index >= 0)
+            {
+                return true;
+            }
+
+            if (material.pbrMetallicRoughness.metallicRoughnessTexture.index >= 0)
+            {
+                return true;
+            }
+
+            if (material.normalTexture.index >= 0)
+            {
+                return true;
+            }
+
+            if (material.occlusionTexture.index >= 0)
+            {
+                return true;
+            }
+
+            if (material.emissiveTexture.index >= 0)
+            {
+                return true;
+            }
+
+            return false;
+        }
+
+        bool ModelUsesAnyTexture(const tinygltf::Model& model)
+        {
+            for (const tinygltf::Material& material : model.materials)
+            {
+                if (MaterialUsesAnyTexture(material))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
     }
 
     void SetVerboseLogging(bool enabled)
@@ -657,7 +700,13 @@ namespace glbopt
             return false;
         }
 
-        if (options.DeduplicateMaterials)
+        Options effectiveOptions = options;
+        if (!ModelUsesAnyTexture(sourceModel))
+        {
+            effectiveOptions.WeldTexcoord0 = false;
+        }
+
+        if (effectiveOptions.DeduplicateMaterials)
         {
             DeduplicateMaterialSlots(sourceModel, outStats);
         }
@@ -673,12 +722,12 @@ namespace glbopt
             return false;
         }
 
-        if (options.ForceDoubleSidedMaterials)
+        if (effectiveOptions.ForceDoubleSidedMaterials)
         {
             ForceAllMaterialsDoubleSided(outputModel);
         }
 
-        if (!BuildMergedOutputModel(outputModel, groups, options, outStats))
+        if (!BuildMergedOutputModel(outputModel, groups, effectiveOptions, outStats))
         {
             return false;
         }
@@ -722,6 +771,7 @@ namespace glbopt
         }
 
         Stats combinedStats{};
+        bool anyTextureInInputs = false;
 
         tinygltf::Model outputModel;
         outputModel.asset.version = "2.0";
@@ -737,6 +787,8 @@ namespace glbopt
                 return false;
             }
 
+            anyTextureInInputs = anyTextureInInputs || ModelUsesAnyTexture(sourceModel);
+
             if (options.DeduplicateMaterials)
             {
                 DeduplicateMaterialSlots(sourceModel, combinedStats);
@@ -748,12 +800,18 @@ namespace glbopt
             }
         }
 
-        if (options.ForceDoubleSidedMaterials)
+        Options effectiveOptions = options;
+        if (!anyTextureInInputs)
+        {
+            effectiveOptions.WeldTexcoord0 = false;
+        }
+
+        if (effectiveOptions.ForceDoubleSidedMaterials)
         {
             ForceAllMaterialsDoubleSided(outputModel);
         }
 
-        if (!BuildMergedOutputModel(outputModel, groups, options, combinedStats))
+        if (!BuildMergedOutputModel(outputModel, groups, effectiveOptions, combinedStats))
         {
             return false;
         }

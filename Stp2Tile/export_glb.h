@@ -15,7 +15,8 @@ bool ExportTileToGlbFile(
     const std::vector<std::uint32_t>& itemIndices,
     const std::string& glbPath,
     const float decimationFactor,
-    const bool debugAppearance
+    const bool debugAppearance,
+    const double nodeBoundsDiagonal = -1.0
     );
 
 bool ExportBoxToGlbFile(

@@ -319,6 +319,24 @@ namespace
         return std::max(lo, std::min(v, hi));
     }
 
+    static double ComputeNodeBoxWeldStep(double nodeDiag, double rootDiag)
+    {
+        const double safeNodeDiag = std::max(0.0, nodeDiag);
+        const double rootStepMin = std::max(1e-12, rootDiag * 1e-9);
+
+        // Shared weld formula for both leaf and proxy meshes.
+        // Example: nodeDiag=100000 -> weldStep ~= 100.
+        constexpr double kWeldFractionOfNodeDiag = 1e-3;
+
+        const double stepMin = std::max(rootStepMin, safeNodeDiag * 1e-9);
+        const double stepMax = std::max(stepMin, safeNodeDiag * 5e-3);
+
+        return ClampDouble(
+            safeNodeDiag * kWeldFractionOfNodeDiag,
+            stepMin,
+            stepMax);
+    }
+
     struct NodeTuning
     {
         float RelativeSize = 0.0f;
@@ -388,42 +406,32 @@ namespace
         const float aggressiveness =
             Clamp01((1.0f - tuning.RelativeSize) * 0.65f + tuning.NormalizedDepth * 0.35f);
 
-        const double rootStepMin = rootDiag * 1e-9;
-        const double rootStepProxyMax = rootDiag * 5e-4;
-        const double rootStepLeafMax = rootDiag * 2e-5;
+        const double weldStep = ComputeNodeBoxWeldStep(nodeDiag, rootDiag);
+        tuning.ProxyPositionStep = static_cast<float>(weldStep);
+        tuning.LeafPositionStep = static_cast<float>(weldStep);
 
-        const double proxyBaseStep = rootDiag * 1e-6;
-        const double leafBaseStep = rootDiag * 2e-7;
-
-        const double proxyStep = ClampDouble(
-            proxyBaseStep * (0.35 + 6.0 * static_cast<double>(aggressiveness)),
-            rootStepMin,
-            std::max(rootStepMin, rootStepProxyMax));
-
-        const double leafStep = ClampDouble(
-            leafBaseStep * (0.8 + 1.6 * static_cast<double>(tuning.NormalizedDepth)),
-            rootStepMin,
-            std::max(rootStepMin, rootStepLeafMax));
-
-        tuning.ProxyPositionStep = static_cast<float>(proxyStep);
-        tuning.LeafPositionStep = static_cast<float>(leafStep);
-
-        // Keep proxy reduction aggressive, but tie to depth and relative size.
+        // Keep proxy reduction visible but less destructive than before.
         tuning.ProxySimplifyRatio =
-            LerpClamped(0.06f, 0.34f, 1.0f - aggressiveness);
+            LerpClamped(0.42f, 0.68f, 1.0f - aggressiveness);
 
         // Mild leaf optimization with conservative retention.
         const float leafAggressiveness =
             Clamp01(tuning.NormalizedDepth * 0.5f + (1.0f - tuning.RelativeSize) * 0.5f);
         tuning.LeafSimplifyRatio =
-            LerpClamped(0.98f, 0.90f, leafAggressiveness);
+            LerpClamped(0.99f, 0.95f, leafAggressiveness);
 
-        // Geometric error model scales with both overall extent and node extent.
+        // Geometric error model Option A:
+        // pure node-size scaling, unit-invariant across mm/miles.
         if (!isLeaf)
         {
-            const double depthBase = (rootDiag / 8.0) * std::pow(0.72, std::max(0, depthFromRoot));
-            const double nodeCap = nodeDiag / 3.5;
-            tuning.GeometricError = std::max(0.0, std::min(depthBase, nodeCap));
+            constexpr double kGeomErrScale = 0.4;
+            constexpr double kGeomErrMinScale = 0.12;
+            constexpr double kGeomErrMaxScale = 0.45;
+
+            const double minErr = nodeDiag * kGeomErrMinScale;
+            const double maxErr = nodeDiag * kGeomErrMaxScale;
+            const double rawErr = nodeDiag * kGeomErrScale;
+            tuning.GeometricError = ClampDouble(rawErr, minErr, std::max(minErr, maxErr));
         }
         else
         {
@@ -433,14 +441,14 @@ namespace
         const double errorFromGeom = std::max(1e-8, tuning.GeometricError / std::max(1e-9, rootDiag));
 
         tuning.ProxySimplifyError = static_cast<float>(ClampDouble(
-            std::max(0.0025, errorFromGeom * 0.75) * (0.85 + 0.55 * static_cast<double>(tuning.NormalizedDepth)),
-            0.0025,
-            0.06));
+            std::max(0.0015, errorFromGeom * 0.40) * (0.85 + 0.30 * static_cast<double>(tuning.NormalizedDepth)),
+            0.0015,
+            0.02));
 
         tuning.LeafSimplifyError = static_cast<float>(ClampDouble(
-            std::max(0.0005, errorFromGeom * 0.2),
-            0.0005,
-            0.008));
+            std::max(0.00035, errorFromGeom * 0.1),
+            0.00035,
+            0.003));
 
         return tuning;
     }
@@ -450,7 +458,7 @@ namespace
         glbopt::Options options;
 
         // Keep proxy reduction deterministic; avoid cross-material collapsing.
-        options.DeduplicateMaterials = false;
+        options.DeduplicateMaterials = true;
 
         // Keep position welding enabled for proxies to avoid ballooning duplicated
         // vertices across merged child content.
@@ -463,13 +471,14 @@ namespace
         options.DropAllBlackColor0 = false;
         options.StripColor0Always = false;
         options.ForceDefaultMaterialForMissing = true;
+        options.ForceDoubleSidedMaterials = false;
 
         options.RemoveDegenerateByIndex = true;
         options.RemoveDegenerateByArea = true;
 
-        options.OptimizeVertexCache = true;
+        options.OptimizeVertexCache = false;
         options.OptimizeOverdraw = false;
-        options.OptimizeVertexFetch = true;
+        options.OptimizeVertexFetch = false;
 
         options.PositionStep = tuning.ProxyPositionStep;
         options.NormalStep   = 0.001f;
@@ -477,7 +486,7 @@ namespace
         options.ColorStep    = 1.0f / 255.0f;
 
         options.DegenerateAreaEpsilonSq = 1e-20f;
-        options.Simplify = true;
+        options.Simplify = false;
         options.SimplifyRatio = tuning.ProxySimplifyRatio;
         options.SimplifyError = tuning.ProxySimplifyError;
         options.OverdrawThreshold = 1.05f;
@@ -489,16 +498,17 @@ namespace
     {
         glbopt::Options options;
 
-        options.DeduplicateMaterials = false;
+        options.DeduplicateMaterials = true;
 
         options.WeldPositions = true;
         options.WeldNormals = true;
         options.WeldTexcoord0 = true;
         options.WeldColor0 = true;
+        options.ForceDoubleSidedMaterials = false;
 
         // Keep leaf weld conservative to reduce risk of topology damage.
         options.PositionStep = tuning.LeafPositionStep;
-        options.NormalStep = 0.001f;
+        options.NormalStep = 0.005f;
         options.TexcoordStep = 0.0001f;
         options.ColorStep = 1.0f / 255.0f;
 
@@ -509,9 +519,9 @@ namespace
         options.SimplifyRatio = tuning.LeafSimplifyRatio;
         options.SimplifyError = tuning.LeafSimplifyError;
 
-        options.OptimizeVertexCache = true;
+        options.OptimizeVertexCache = false;
         options.OptimizeOverdraw = false;
-        options.OptimizeVertexFetch = true;
+        options.OptimizeVertexFetch = false;
 
         return options;
     }
@@ -555,7 +565,8 @@ namespace
             node.items,
             rawFullGlbPath.string(),
             0.0f,
-            opt.debugAppearance);
+            opt.debugAppearance,
+            DiagonalLength(artifact.bounds));
 
         if (!okRaw)
         {
@@ -591,25 +602,22 @@ namespace
 
         if (opt.debugAppearance)
         {
+            const double diag = DiagonalLength(artifact.bounds);
             const std::size_t trisIn = leafGlbStats.InputPrimitiveElementCount / 3u;
             const std::size_t trisOut = leafGlbStats.OutputPrimitiveElementCount / 3u;
+            double reductionPct = 0.0;
+            if (trisIn > 0u)
+            {
+                reductionPct = 100.0 *
+                    (1.0 - (static_cast<double>(trisOut) / static_cast<double>(trisIn)));
+            }
+            reductionPct = ClampDouble(reductionPct, 0.0, 100.0);
 
             std::cout << "[LeafGlbOpt] tile=" << baseName
-                      << " depth=" << depthFromRoot
-                      << " relSize=" << tuning.RelativeSize
-                      << " weldPosStep=" << leafGlbOptions.PositionStep
-                      << " simplifyRatio=" << leafGlbOptions.SimplifyRatio
-                      << " simplifyError=" << leafGlbOptions.SimplifyError
-                      << " vertsIn=" << leafGlbStats.InputVertexCount
-                      << " vertsOut=" << leafGlbStats.OutputVertexCount
-                      << " vertsMerged=" << leafGlbStats.MergedVertexCount
-                      << " trisIn=" << trisIn
-                      << " trisOut=" << trisOut
-                      << " matsIn=" << leafGlbStats.MaterialCountInput
-                      << " matsCanon=" << leafGlbStats.MaterialCountCanonical
-                      << " matRemap=" << leafGlbStats.MaterialSlotsRemapped
-                      << " primIn=" << leafGlbStats.PrimitiveCountExtracted
-                      << " primOut=" << leafGlbStats.PrimitiveCountMergedOut
+                      << " size=" << diag
+                      << " weld=" << leafGlbOptions.PositionStep
+                      << " tris=" << trisOut
+                      << " %" << reductionPct
                       << "\n";
         }
 
@@ -698,34 +706,33 @@ namespace
         const bool okProxyBake =
             glbopt::OptimizeGlbFiles(childGlbPaths, proxyGlbPath.string(), glbOptions, proxyStats);
 
+        if (opt.debugAppearance)
+        {
+            const double diag = DiagonalLength(artifact.bounds);
+            const std::size_t trisIn = proxyStats.InputPrimitiveElementCount / 3u;
+            const std::size_t trisOut = proxyStats.OutputPrimitiveElementCount / 3u;
+            double reductionPct = 0.0;
+            if (trisIn > 0u)
+            {
+                reductionPct = 100.0 *
+                    (1.0 - (static_cast<double>(trisOut) / static_cast<double>(trisIn)));
+            }
+            reductionPct = ClampDouble(reductionPct, 0.0, 100.0);
+
+            std::cout << "[ProxyGlbOpt] tile=" << baseName
+                      << " size=" << diag
+                      << " weld=" << glbOptions.PositionStep
+                      << " tris=" << trisOut
+                      << " %" << reductionPct
+                      << "\n";
+        }
+
+        const bool expectNonEmpty = node.totalTriangles > 0;
         if (!okProxyBake)
         {
             return false;
         }
 
-        if (opt.debugAppearance)
-        {
-            const std::size_t trisIn = proxyStats.InputPrimitiveElementCount / 3u;
-            const std::size_t trisOut = proxyStats.OutputPrimitiveElementCount / 3u;
-
-            std::cout << "[ProxyGlbOpt] tile=" << baseName
-                      << " depth=" << depthFromRoot
-                      << " relSize=" << tuning.RelativeSize
-                      << " importance=" << tuning.Importance
-                      << " weldPosStep=" << glbOptions.PositionStep
-                      << " simplifyRatio=" << glbOptions.SimplifyRatio
-                      << " simplifyError=" << glbOptions.SimplifyError
-                      << " geomError=" << tuning.GeometricError
-                      << " vertsIn=" << proxyStats.InputVertexCount
-                      << " vertsOut=" << proxyStats.OutputVertexCount
-                      << " trisIn=" << trisIn
-                      << " trisOut=" << trisOut
-                      << " primIn=" << proxyStats.PrimitiveCountExtracted
-                      << " primOut=" << proxyStats.PrimitiveCountMergedOut
-                      << "\n";
-        }
-
-        const bool expectNonEmpty = node.totalTriangles > 0;
         const bool geometryOk =
             ValidateTileGeometryStats(proxyStats, expectNonEmpty, baseName + "_proxy");
         const bool reductionOk =
@@ -822,14 +829,23 @@ namespace
         }
         else
         {
-            ok = BakeInternalProxyArtifact(
-                node,
-                opt,
-                artifact,
-                bakeState,
-                depthFromRoot,
-                maxDepth,
-                rootBounds);
+            if (opt.contentOnlyAtLeaves)
+            {
+                artifact.GlbPath.clear();
+                artifact.ContentUri.clear();
+                ok = true;
+            }
+            else
+            {
+                ok = BakeInternalProxyArtifact(
+                    node,
+                    opt,
+                    artifact,
+                    bakeState,
+                    depthFromRoot,
+                    maxDepth,
+                    rootBounds);
+            }
         }
 
         if (!ok)
@@ -891,7 +907,7 @@ namespace
             geometricError = tuning.GeometricError;
             if (!isRoot && parentGeometricError > 0.0)
             {
-                const double maxAllowed = parentGeometricError * 0.7;
+                const double maxAllowed = parentGeometricError * 0.97;
                 geometricError = std::min(geometricError, maxAllowed);
             }
         }

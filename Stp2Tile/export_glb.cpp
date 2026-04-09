@@ -33,6 +33,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <TopoDS.hxx>
+#include <gp_Pnt.hxx>
 
 Handle(TDocStd_Document) CreateEmptyXcafDocument()
 {
@@ -195,7 +196,8 @@ bool ExportTileToGlbFile(
     const std::vector<std::uint32_t>& itemIndices,
     const std::string& glbPath,
     const float decimationFactor,
-    const bool debugAppearance)
+    const bool debugAppearance,
+    const double nodeBoundsDiagonal)
 {
     Handle(TDocStd_Document) tileDoc = CreateEmptyXcafDocument();
     Handle(XCAFDoc_ShapeTool) tileShapeTool = GetShapeTool(tileDoc);
@@ -295,12 +297,43 @@ bool ExportTileToGlbFile(
         return false;
     }
 
-    const float t = ClampDecimation(decimationFactor);
+    float linearDeflection = 0.05f;
+    float angularDeflectionDeg = 0.75f;
 
-    // Do the simplification here by changing OCCT tessellation quality.
-    // Lower t => finer mesh. Higher t => coarser proxy mesh.
-    const float linearDeflection = LerpClamped(0.05f, 25.0f, t);
-    const float angularDeflectionDeg = LerpClamped(0.75f, 12.0f, t);
+    if (nodeBoundsDiagonal > 0.0)
+    {
+        const double d = std::max(1e-9, nodeBoundsDiagonal);
+
+        // Node-size-based tessellation for leaves:
+        // smaller nodes -> finer tessellation, larger nodes -> coarser tessellation.
+        constexpr double kLinearScale = 1.5e-3;
+        constexpr double kLinearMin = 5e-5;
+        constexpr double kLinearMax = 2.0;
+
+        constexpr double kAngularBase = 0.9;
+        constexpr double kAngularScale = 0.35;
+        constexpr double kAngularRefDiag = 1.0;
+        constexpr double kAngularMin = 0.35;
+        constexpr double kAngularMax = 3.0;
+
+        const double linearDefl = std::clamp(kLinearScale * d, kLinearMin, kLinearMax);
+        const double angularDefl = std::clamp(
+            kAngularBase + kAngularScale * std::log10(d / kAngularRefDiag),
+            kAngularMin,
+            kAngularMax);
+
+        linearDeflection = static_cast<float>(linearDefl);
+        angularDeflectionDeg = static_cast<float>(angularDefl);
+    }
+    else
+    {
+        const float t = ClampDecimation(decimationFactor);
+
+        // Legacy decimation-factor tessellation path.
+        // Lower t => finer mesh. Higher t => coarser proxy mesh.
+        linearDeflection = LerpClamped(0.05f, 25.0f, t);
+        angularDeflectionDeg = LerpClamped(0.75f, 12.0f, t);
+    }
 
     std::size_t triCount = 0;
     for (const TDF_Label& exportedLabel : exportedLabels)
@@ -362,6 +395,84 @@ bool ExportTileToGlbFile(
         std::cerr << "[ExportTile] failed glb path=" << glbPath
                   << " items=" << itemIndices.size()
                   << " status=error\n";
+    }
+
+    return ok;
+}
+
+bool ExportBoxToGlbFile(
+    const Bnd_Box& bounds,
+    const std::string& glbPath)
+{
+    if (bounds.IsVoid())
+    {
+        std::cerr << "[ExportBox] invalid bounds path=" << glbPath << " status=void\n";
+        return false;
+    }
+
+    double xmin = 0.0;
+    double ymin = 0.0;
+    double zmin = 0.0;
+    double xmax = 0.0;
+    double ymax = 0.0;
+    double zmax = 0.0;
+    bounds.Get(xmin, ymin, zmin, xmax, ymax, zmax);
+
+    constexpr double kMinExtent = 1e-6;
+    if ((xmax - xmin) < kMinExtent)
+    {
+        const double c = 0.5 * (xmin + xmax);
+        xmin = c - 0.5 * kMinExtent;
+        xmax = c + 0.5 * kMinExtent;
+    }
+    if ((ymax - ymin) < kMinExtent)
+    {
+        const double c = 0.5 * (ymin + ymax);
+        ymin = c - 0.5 * kMinExtent;
+        ymax = c + 0.5 * kMinExtent;
+    }
+    if ((zmax - zmin) < kMinExtent)
+    {
+        const double c = 0.5 * (zmin + zmax);
+        zmin = c - 0.5 * kMinExtent;
+        zmax = c + 0.5 * kMinExtent;
+    }
+
+    Handle(TDocStd_Document) tileDoc = CreateEmptyXcafDocument();
+    Handle(XCAFDoc_ShapeTool) tileShapeTool = GetShapeTool(tileDoc);
+
+    const TopoDS_Shape boxShape = BRepPrimAPI_MakeBox(
+        gp_Pnt(xmin, ymin, zmin),
+        gp_Pnt(xmax, ymax, zmax)).Shape();
+
+    const TDF_Label boxLabel = tileShapeTool->AddShape(boxShape, Standard_False);
+
+    BRepMesh_IncrementalMesh mesh(
+        boxShape,
+        0.25,
+        Standard_False,
+        8.0,
+        Standard_True);
+    mesh.Perform();
+
+    RWGltf_CafWriter writer(TCollection_AsciiString(glbPath.c_str()), Standard_True);
+    writer.SetTransformationFormat(RWGltf_WriterTrsfFormat_Compact);
+
+    TDF_LabelSequence rootLabels;
+    rootLabels.Append(boxLabel);
+
+    const TColStd_MapOfAsciiString* labelFilter = nullptr;
+    TColStd_IndexedDataMapOfStringString fileInfo;
+    Message_ProgressRange progress;
+
+    const bool ok = writer.Perform(tileDoc, rootLabels, labelFilter, fileInfo, progress);
+    if (ok)
+    {
+        std::cout << "[ExportBox] wrote glb path=" << glbPath << " status=ok\n";
+    }
+    else
+    {
+        std::cerr << "[ExportBox] failed glb path=" << glbPath << " status=error\n";
     }
 
     return ok;

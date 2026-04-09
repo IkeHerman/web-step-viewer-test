@@ -169,7 +169,7 @@ struct CliOptions
     std::string tilePrefix = "tile_";
     bool keepGlb = true;
     bool useTightBounds = true;
-    bool contentOnlyAtLeaves = true;
+    bool contentOnlyAtLeaves = false;
     bool verbose = false;
 };
 
@@ -190,8 +190,8 @@ static void PrintUsage(const char* programName)
         << "      --discard-glb            Delete intermediate .glb files after wrap\n"
         << "      --tight-bounds           Enable tight tile bounds (default)\n"
         << "      --no-tight-bounds        Disable tight tile bounds\n"
-        << "      --content-only-leaves    Emit content only at leaves (default)\n"
-        << "      --content-all-levels     Allow content at internal levels\n"
+        << "      --content-only-leaves    Emit content only at leaves\n"
+        << "      --content-all-levels     Allow content at internal levels (default)\n"
         << "  -v, --verbose                Enable verbose debug output\n"
         << "  -h, --help                   Show this help\n";
 }
