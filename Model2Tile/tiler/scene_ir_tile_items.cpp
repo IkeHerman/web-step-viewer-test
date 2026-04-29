@@ -7,15 +7,18 @@ namespace tiler
 std::vector<TileItem> BuildTileItemsFromSceneIR(const core::SceneIR& scene)
 {
     std::vector<TileItem> items;
-    items.reserve(scene.occurrences.size());
+    items.reserve(scene.instances.size());
 
-    for (std::size_t i = 0; i < scene.occurrences.size(); ++i)
+    for (std::size_t i = 0; i < scene.instances.size(); ++i)
     {
-        const core::SceneOccurrence& source = scene.occurrences[i];
+        const core::SceneInstance& source = scene.instances[i];
         TileItem item;
-        item.id = static_cast<std::uint32_t>(i);
+        item.id = source.occurrenceIndex;
         item.worldBounds = source.worldBounds;
-        item.triangleCount = source.triangleCount;
+        if (source.prototypeId < scene.prototypes.size())
+        {
+            item.triangleCount = scene.prototypes[source.prototypeId].triangleCount;
+        }
         items.push_back(item);
     }
 

@@ -51,6 +51,7 @@ int FbxImporter::Run(const CliOptions& cli) const
     std::cerr
         << "FBX import is routed but not yet implemented.\n"
         << "Input: " << cli.inputPath << "\n"
+        << "Target contract: produce instance-aware SceneIR (prototypes + instances).\n"
         << "Use --input-format step for STEP input.\n";
     return 2;
 }

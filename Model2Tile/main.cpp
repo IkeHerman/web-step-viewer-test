@@ -130,6 +130,32 @@ static double BoundsMaxSideLength(const Bnd_Box& box)
     return std::max(sx, std::max(sy, sz));
 }
 
+static std::string BuildOccurrenceColorSignature(const Occurrence& occ)
+{
+    if (!occ.Appearance)
+    {
+        return "no-appearance";
+    }
+
+    std::ostringstream ss;
+    const CachedColorSet& c = occ.Appearance->ResolvedShapeColors;
+    ss << "shape(" << c.HasGen << "," << c.HasSurf << "," << c.HasCurv << ")";
+    if (c.HasGen)  { ss << "|gen:" << c.Gen.Red() << "," << c.Gen.Green() << "," << c.Gen.Blue(); }
+    if (c.HasSurf) { ss << "|surf:" << c.Surf.Red() << "," << c.Surf.Green() << "," << c.Surf.Blue(); }
+    if (c.HasCurv) { ss << "|curv:" << c.Curv.Red() << "," << c.Curv.Green() << "," << c.Curv.Blue(); }
+
+    std::size_t faceColorEntries = 0;
+    for (const CachedFaceAppearance& fa : occ.Appearance->Faces)
+    {
+        if (fa.Colors.HasGen || fa.Colors.HasSurf || fa.Colors.HasCurv)
+        {
+            ++faceColorEntries;
+        }
+    }
+    ss << "|faceColorEntries:" << faceColorEntries;
+    return ss.str();
+}
+
 static bool IsStepPath(const std::filesystem::path& p)
 {
     std::string ext = p.extension().string();
@@ -1016,6 +1042,29 @@ int RunStepPipeline(const CliOptions& cli)
                       << " faceSlots=" << totalFaceSlots
                       << "\n\n";
 
+            std::unordered_map<std::string, std::size_t> colorSignatureCounts;
+            colorSignatureCounts.reserve(occurrences.size());
+            for (const Occurrence& occ : occurrences)
+            {
+                ++colorSignatureCounts[BuildOccurrenceColorSignature(occ)];
+            }
+            std::vector<std::pair<std::string, std::size_t>> rankedColorSigs(
+                colorSignatureCounts.begin(), colorSignatureCounts.end());
+            std::sort(
+                rankedColorSigs.begin(),
+                rankedColorSigs.end(),
+                [](const auto& a, const auto& b) { return a.second > b.second; });
+
+            std::cout << "[AppearanceProbe:TopColorSignatures] unique="
+                      << rankedColorSigs.size() << "\n";
+            const std::size_t topN = std::min<std::size_t>(10, rankedColorSigs.size());
+            for (std::size_t i = 0; i < topN; ++i)
+            {
+                std::cout << "  - count=" << rankedColorSigs[i].second
+                          << " signature=" << rankedColorSigs[i].first << "\n";
+            }
+            std::cout << "\n";
+
         }
  
         const core::SceneIR sceneIr = adapters::BuildSceneIRFromStepOccurrences(
@@ -1027,9 +1076,13 @@ int RunStepPipeline(const CliOptions& cli)
         if (g_verboseLogging)
         {
             std::cout << "[SceneIR] format=" << sceneIr.sourceFormat
+                      << " prototypes=" << sceneIr.prototypes.size()
+                      << " instances=" << sceneIr.instances.size()
                       << " occurrences=" << sceneIr.occurrences.size()
                       << " tileItems=" << irTileItems.size()
                       << " totalTriangles=" << sceneIr.totalTriangles
+                      << " explicitRefInstances=" << sceneIr.explicitReferenceInstances
+                      << " qualifiedDedupInstances=" << sceneIr.qualifiedDedupInstances
                       << "\n";
         }
 
