@@ -51,6 +51,6 @@ __pycache__/
 .env.*
 
 # Build directories
-Stp2Tile/build/
+Model2Tile/build/
 source_data/
 Tile-Viewer/public/

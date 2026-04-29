@@ -8,8 +8,8 @@ This project bundles or consumes the following open-source components. Refer to 
   - License: GNU Lesser General Public License v2.1 (LGPL-2.1-only). Some Open CASCADE modules are additionally covered by the Open CASCADE Technology Public License (OCPPL); consult https://dev.opencascade.org/index.php/occt_sourcecode for the exact distribution and license notices.  When distributing binaries that link to these libraries, honor the LGPL-2.1 runtime obligations (provide the LGPL text, enable relinking, and document the third-party usage).
 
 - **meshoptimizer (Arseny Kapoulkine)**
-  - Source tree under `Stp2Tile/dep/meshoptimizer` (including `gltf` and `js` subdirectories).
-  - License: MIT (see `Stp2Tile/dep/meshoptimizer/LICENSE.md`).
+  - Source tree under `Model2Tile/dep/meshoptimizer` (including `gltf` and `js` subdirectories).
+  - License: MIT (see `Model2Tile/dep/meshoptimizer/LICENSE.md`).
 
 ## JavaScript dependencies (Tile-Viewer)
 
