@@ -1,0 +1,46 @@
+{
+  "contractVersion": 1,
+  "description": "Golden STEP fixtures and minimum fidelity assertions.",
+  "fixtures": [
+    {
+      "id": "scania_assembly",
+      "path": "source_data/Test/Scania-8x4.stp",
+      "assertions": {
+        "minOccurrences": 1,
+        "minShapeColorOccurrences": 1,
+        "minFaceColorEntries": 1
+      }
+    },
+    {
+      "id": "cruise_assembly",
+      "path": "source_data/Cruise/Cruise_Assembly.stp",
+      "assertions": {
+        "minOccurrences": 1,
+        "minMetadataOccurrences": 1
+      }
+    },
+    {
+      "id": "downie_coordination",
+      "path": "source_data/Downie/PNTR-HOK-ID_mdavidgrangerRZULW - 3D View - !!INTR MODEL - COORDINATION VIEW - PBP AND SP.step",
+      "assertions": {
+        "minOccurrences": 1,
+        "minShapeColorOccurrences": 1
+      }
+    },
+    {
+      "id": "downie_small",
+      "path": "source_data/Downie Small/PNTR-HOK-ID_mdavidgrangerRZULW-3DView-200ADMINLEVEL-DRAFTROOM.step",
+      "assertions": {
+        "minOccurrences": 1
+      }
+    },
+    {
+      "id": "vinci_component",
+      "path": "source_data/Vinci_SurfacePro11_STEP/Vinci_SurfacePro11 - Component4.step",
+      "assertions": {
+        "minOccurrences": 1,
+        "minShapeColorOccurrences": 1
+      }
+    }
+  ]
+}

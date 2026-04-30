@@ -4,6 +4,7 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <map>
 
 
 namespace
@@ -26,18 +27,62 @@ namespace
         const std::uint8_t* p = static_cast<const std::uint8_t*>(data);
         out.insert(out.end(), p, p + len);
     }
+
+    std::string JsonEscape(const std::string& input)
+    {
+        std::string out;
+        out.reserve(input.size() + 8);
+        for (const char ch : input)
+        {
+            switch (ch)
+            {
+                case '\\': out += "\\\\"; break;
+                case '"': out += "\\\""; break;
+                case '\n': out += "\\n"; break;
+                case '\r': out += "\\r"; break;
+                case '\t': out += "\\t"; break;
+                default: out.push_back(ch); break;
+            }
+        }
+        return out;
+    }
+
+    std::string BuildBatchTableJson(const std::map<std::string, std::string>& metadata)
+    {
+        if (metadata.empty())
+        {
+            return "{}";
+        }
+
+        std::string json = "{";
+        bool first = true;
+        for (const auto& entry : metadata)
+        {
+            if (!first)
+            {
+                json += ",";
+            }
+            first = false;
+            json += "\"" + JsonEscape(entry.first) + "\":[\"" + JsonEscape(entry.second) + "\"]";
+        }
+        json += "}";
+        return json;
+    }
 }
 
 namespace B3dm
 {
-    std::vector<std::uint8_t> WrapGlbBytes(const std::vector<std::uint8_t>& glbBytes)
+    static std::vector<std::uint8_t> WrapGlbBytesWithMetadata(
+        const std::vector<std::uint8_t>& glbBytes,
+        const std::map<std::string, std::string>& metadata)
     {
-        // Minimal tables (valid for many viewers). No batch features.
-        const char* ftJson = "{}";
+        const std::string ftJsonStorage = metadata.empty() ? "{}" : "{\"BATCH_LENGTH\":1}";
+        const char* ftJson = ftJsonStorage.c_str();
         const std::uint32_t ftJsonLen = static_cast<std::uint32_t>(std::strlen(ftJson));
         const std::uint32_t ftJsonLenPadded = PadTo8(ftJsonLen);
 
-        const char* btJson = "{}";
+        const std::string btJsonStorage = BuildBatchTableJson(metadata);
+        const char* btJson = btJsonStorage.c_str();
         const std::uint32_t btJsonLen = static_cast<std::uint32_t>(std::strlen(btJson));
         const std::uint32_t btJsonLenPadded = PadTo8(btJsonLen);
 
@@ -77,6 +122,11 @@ namespace B3dm
         return out;
     }
 
+    std::vector<std::uint8_t> WrapGlbBytes(const std::vector<std::uint8_t>& glbBytes)
+    {
+        return WrapGlbBytesWithMetadata(glbBytes, {});
+    }
+
     std::vector<std::uint8_t> ReadFileBytes(const std::string& path)
     {
         std::ifstream f(path, std::ios::binary);
@@ -111,13 +161,21 @@ namespace B3dm
 
     bool WrapGlbFileToB3dmFile(const std::string& glbPath, const std::string& b3dmPath)
     {
+        return WrapGlbFileToB3dmFile(glbPath, b3dmPath, {});
+    }
+
+    bool WrapGlbFileToB3dmFile(
+        const std::string& glbPath,
+        const std::string& b3dmPath,
+        const std::map<std::string, std::string>& metadata)
+    {
         //std::cout << "Reading GLB file: " << glbPath << "\n";
 
         std::vector<std::uint8_t> glb = ReadFileBytes(glbPath);
         if (glb.empty())
             return false;
 
-        std::vector<std::uint8_t> b3dm = WrapGlbBytes(glb);
+        std::vector<std::uint8_t> b3dm = WrapGlbBytesWithMetadata(glb, metadata);
 
         //std::cout << "Writing B3DM file: " << b3dmPath << "\n";
 

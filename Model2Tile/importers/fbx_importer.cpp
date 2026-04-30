@@ -31,6 +31,14 @@ const char* FbxImporter::FormatName() const
     return "fbx";
 }
 
+ImportContract FbxImporter::Contract() const
+{
+    ImportContract contract;
+    contract.producesSceneIr = false;
+    contract.emitsInstanceLodUris = false;
+    return contract;
+}
+
 bool FbxImporter::Supports(const CliOptions& cli) const
 {
     if (cli.inputFormat == "fbx")
@@ -51,7 +59,7 @@ int FbxImporter::Run(const CliOptions& cli) const
     std::cerr
         << "FBX import is routed but not yet implemented.\n"
         << "Input: " << cli.inputPath << "\n"
-        << "Target contract: produce instance-aware SceneIR (prototypes + instances).\n"
+        << "Target contract: produce SceneIR (prototypes + instances) with instance LOD URIs.\n"
         << "Use --input-format step for STEP input.\n";
     return 2;
 }

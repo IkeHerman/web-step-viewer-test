@@ -2,6 +2,7 @@
 #pragma once
 
 #include <cstdint>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -19,4 +20,8 @@ namespace B3dm
 
     /// Convenience: read GLB from glbPath, wrap into B3DM, write to b3dmPath.
     bool WrapGlbFileToB3dmFile(const std::string& glbPath, const std::string& b3dmPath);
+    bool WrapGlbFileToB3dmFile(
+        const std::string& glbPath,
+        const std::string& b3dmPath,
+        const std::map<std::string, std::string>& metadata);
 }

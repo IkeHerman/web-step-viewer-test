@@ -374,6 +374,9 @@ namespace glbopt
                       << " matsIn=" << stats.MaterialCountInput
                       << " matsCanon=" << stats.MaterialCountCanonical
                       << " matRemap=" << stats.MaterialSlotsRemapped
+                      << " vertsIn=" << stats.InputVertexCount
+                      << " vertsOut=" << stats.OutputVertexCount
+                      << " mergedVerts=" << stats.MergedVertexCount
                       << " trisIn=" << trisIn
                       << " trisOut=" << trisOut
                       << " " << roundedPct << "% " << changeWord

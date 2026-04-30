@@ -32,6 +32,11 @@ const char* StepImporter::FormatName() const
     return "step";
 }
 
+ImportContract StepImporter::Contract() const
+{
+    return ImportContract{};
+}
+
 bool StepImporter::Supports(const CliOptions& cli) const
 {
     if (cli.inputFormat == "step")

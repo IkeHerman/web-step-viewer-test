@@ -4,7 +4,8 @@
 #include <string>
 #include <vector>
 
-#include "octree.h" // TileOctree, Occurrence
+#include "octree.h"
+#include "core/scene_ir.h"
 
 namespace TilesetEmit
 {
@@ -15,9 +16,15 @@ namespace TilesetEmit
         std::string tileFilePrefix = "tile_";  // tile_0.b3dm, tile_1.b3dm...
         bool keepGlbFilesForDebug = false;
         bool debugAppearance = false;
+        bool disableGlbopt = false;
+        double viewerTargetSse = 80.0;
 
         bool useTightBounds = false;          // union of subtree item bounds (slower but better)
         bool contentOnlyAtLeaves = false;     // generally keep false with promotion rule
+
+        // Pre-baked high/low GLB links are read from SceneIR instances.
+        double instanceMinSizeRatio = 1e-3;   // min (instance diagonal / tile diagonal); 0 = no cull
+        const core::SceneIR* sceneIr = nullptr;
     };
 
     // Writes:
@@ -26,6 +33,5 @@ namespace TilesetEmit
     // - optional manifest mapping tile->occurrences (see .cpp)
     bool EmitTilesetAndB3dm(
         const TileOctree& tree,
-        const std::vector<Occurrence>& occurrences,
         const Options& opt);
 }

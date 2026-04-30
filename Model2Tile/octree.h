@@ -1,14 +1,12 @@
 // octree.h
 #pragma once
 
-#include "common.h"
+#include "tiler/scene_ir_tile_items.h"
 
 #include <array>
 #include <cstdint>
 #include <memory>
 #include <vector>
-
-#include <Bnd_Box.hxx>
 
 class TileOctree
 {
@@ -25,7 +23,7 @@ public:
 
     struct Node
     {
-        Bnd_Box volume;
+        core::Aabb volume;
         int depth = 0;
         std::uint64_t totalTriangles = 0;
         std::vector<std::uint32_t> items;
@@ -38,36 +36,36 @@ public:
     TileOctree();
     explicit TileOctree(const Config& cfg);
 
-    void Build(const std::vector<Occurrence>& occurrences, Bnd_Box& globalBounds);
+    void Build(const std::vector<tiler::TileItem>& items, const core::Aabb& globalBounds);
 
     const Node& Root() const;
-    const Bnd_Box& GlobalBounds() const;
+    const core::Aabb& GlobalBounds() const;
 
     static void CollectSubtreeItems(const TileOctree::Node& node,
                                     std::vector<std::uint32_t>& out);
 
 private:
-    static void GetMinMax(const Bnd_Box& box,
+    static void GetMinMax(const core::Aabb& box,
                           double& xmin, double& ymin, double& zmin,
                           double& xmax, double& ymax, double& zmax);
 
-    static double MaxSideLength(const Bnd_Box& box);
+    static double MaxSideLength(const core::Aabb& box);
 
-    static std::array<Bnd_Box, 8> MakeChildVolumes(const Bnd_Box& parent, double looseFactor);
+    static std::array<core::Aabb, 8> MakeChildVolumes(const core::Aabb& parent, double looseFactor);
 
-    static int FindContainingChild(const std::array<Bnd_Box, 8>& children,
-                                   const Bnd_Box& itemBounds);
+    static int FindContainingChild(const std::array<core::Aabb, 8>& children,
+                                   const core::Aabb& itemBounds);
 
-    static int ChooseChildByItemCenter(const Bnd_Box& parent,
-                                       const Bnd_Box& itemBounds);
+    static int ChooseChildByItemCenter(const core::Aabb& parent,
+                                       const core::Aabb& itemBounds);
 
     void BuildNode(Node& node,
-                   const std::vector<Occurrence>& occurrences,
+                   const std::vector<tiler::TileItem>& items,
                    const std::vector<std::uint32_t>& inputItems,
                    std::uint64_t inputTotalTriangles);
 
 private:
     Config m_cfg;
     std::unique_ptr<Node> m_root;
-    Bnd_Box m_global;
+    core::Aabb m_global;
 };

@@ -1,4 +1,4 @@
-#include "export_glb.h"
+#include "step_glb_export.h"
 
 #include <fstream>
 #include <stdexcept>
@@ -24,6 +24,7 @@
 #include <BRep_Tool.hxx>
 #include <Poly_Triangulation.hxx>
 #include <TDF_Tool.hxx>
+#include <BRepTools.hxx>
 
 #include <Bnd_Box.hxx>
 #include <BRepBndLib.hxx>
@@ -32,8 +33,61 @@
 #include <cmath>
 #include <algorithm>
 #include <cstddef>
+#include <filesystem>
 #include <TopoDS.hxx>
 #include <gp_Pnt.hxx>
+
+#include "../dep/tinygltf/tiny_gltf.h"
+
+namespace
+{
+std::filesystem::path g_fidelityArtifactDirectory;
+
+std::string JsonEscape(const std::string& input)
+{
+    std::string out;
+    out.reserve(input.size() + 8);
+    for (const char ch : input)
+    {
+        switch (ch)
+        {
+            case '\\': out += "\\\\"; break;
+            case '"': out += "\\\""; break;
+            case '\n': out += "\\n"; break;
+            case '\r': out += "\\r"; break;
+            case '\t': out += "\\t"; break;
+            default: out.push_back(ch); break;
+        }
+    }
+    return out;
+}
+
+void AppendFidelityJsonLine(const std::string& fileName, const std::string& payload)
+{
+    if (g_fidelityArtifactDirectory.empty())
+    {
+        return;
+    }
+    std::error_code ec;
+    std::filesystem::create_directories(g_fidelityArtifactDirectory, ec);
+    std::ofstream out(g_fidelityArtifactDirectory / fileName, std::ios::app);
+    if (!out)
+    {
+        return;
+    }
+    out << payload << "\n";
+}
+}
+
+void ConfigureFidelityArtifactOutput(const std::string& directoryPath)
+{
+    if (directoryPath.empty())
+    {
+        g_fidelityArtifactDirectory.clear();
+        return;
+    }
+    g_fidelityArtifactDirectory = std::filesystem::path(directoryPath);
+}
 
 Handle(TDocStd_Document) CreateEmptyXcafDocument()
 {
@@ -89,8 +143,6 @@ static void ApplyColorsToLabelOrShape(
         return;
     }
 
-    // For shaded mesh export, prioritize surface color and then general color.
-    // Curve color is typically intended for wireframe edges and can mute shading.
     if (colors.HasSurf)
     {
         if (!targetLabel.IsNull())
@@ -180,24 +232,126 @@ static std::size_t CountTriangles(const TopoDS_Shape& shape)
     return triangleCount;
 }
 
-static float LerpClamped(float a, float b, float t)
+static std::size_t CountTrianglesInGltfModel(const tinygltf::Model& gltfModel)
 {
-    t = std::clamp(t, 0.0f, 1.0f);
-    return a + (b - a) * t;
+    std::size_t triangleCount = 0;
+    for (const tinygltf::Mesh& mesh : gltfModel.meshes)
+    {
+        for (const tinygltf::Primitive& primitive : mesh.primitives)
+        {
+            const int mode = (primitive.mode == -1) ? TINYGLTF_MODE_TRIANGLES : primitive.mode;
+            if (mode != TINYGLTF_MODE_TRIANGLES)
+            {
+                continue;
+            }
+
+            if (primitive.indices >= 0 &&
+                static_cast<std::size_t>(primitive.indices) < gltfModel.accessors.size())
+            {
+                const tinygltf::Accessor& indexAccessor =
+                    gltfModel.accessors[static_cast<std::size_t>(primitive.indices)];
+                triangleCount += static_cast<std::size_t>(indexAccessor.count / 3);
+                continue;
+            }
+
+            const auto positionIt = primitive.attributes.find("POSITION");
+            if (positionIt != primitive.attributes.end())
+            {
+                const int accessorIndex = positionIt->second;
+                if (accessorIndex >= 0 &&
+                    static_cast<std::size_t>(accessorIndex) < gltfModel.accessors.size())
+                {
+                    const tinygltf::Accessor& posAccessor =
+                        gltfModel.accessors[static_cast<std::size_t>(accessorIndex)];
+                    triangleCount += static_cast<std::size_t>(posAccessor.count / 3);
+                }
+            }
+        }
+    }
+    return triangleCount;
 }
 
-static float ClampDecimation(float decimationFactor)
+ExportResolvedTessellation ResolveExportTessellation(
+    const ExportTessellationPolicy& policy)
 {
-    return std::clamp(decimationFactor, 0.0f, 1.0f);
+    ExportResolvedTessellation out;
+    out.chosenSse = std::max(1.0, policy.viewerTargetSse);
+
+    const double diag = std::max(1e-9, policy.nodeBoundsDiagonal);
+    const double geomErr = std::max(0.0, policy.tileGeometricError);
+    const double relativeError = geomErr / std::max(1e-9, diag);
+    const double classBias = (policy.tileClass == ExportTileClass::Proxy) ? 2.4 : 0.55;
+    const double sseScale = std::clamp(out.chosenSse / 80.0, 0.5, 3.0);
+
+    double linear = diag * std::max(5e-4, relativeError * classBias * policy.qualityBias * sseScale);
+    if (geomErr <= 1e-12)
+    {
+        linear = diag * ((policy.tileClass == ExportTileClass::Proxy) ? 3.0e-2 : 2.0e-3);
+    }
+    const double linearMinAbs = std::max(1e-12, diag * std::max(1e-9, policy.linearMinFraction));
+    const double linearMaxAbs = std::max(linearMinAbs, diag * std::max(policy.linearMinFraction, policy.linearMaxFraction));
+    linear = std::clamp(linear, linearMinAbs, linearMaxAbs);
+
+    double angular = (policy.tileClass == ExportTileClass::Proxy) ? 1.6 : 0.5;
+    angular += std::clamp(std::log10(std::max(1e-6, linear / std::max(1e-9, diag))), -2.0, 1.0) * 0.7;
+    angular = std::clamp(angular, policy.angularMinDeg, policy.angularMaxDeg);
+
+    out.linearDeflection = linear;
+    out.angularDeflectionDeg = angular;
+    return out;
+}
+
+ExportTessellationPolicy MakeInstanceHighTessellationPolicy(
+    const double viewerTargetSse,
+    const double occurrenceBoundsDiagonal)
+{
+    const double d = std::max(1e-9, occurrenceBoundsDiagonal);
+    ExportTessellationPolicy p;
+    p.viewerTargetSse = viewerTargetSse;
+    p.tileGeometricError = 0.0;
+    p.nodeBoundsDiagonal = d;
+    p.linearMinFraction = 2.0e-4;
+    p.linearMaxFraction = 1.5e-2;
+    p.tileClass = ExportTileClass::Leaf;
+    p.qualityBias = 0.75;
+    p.angularMinDeg = 3.0;
+    p.angularMaxDeg = 9.0;
+    return p;
+}
+
+ExportTessellationPolicy MakeInstanceLowTessellationPolicy(
+    const double viewerTargetSse,
+    const double occurrenceBoundsDiagonal)
+{
+    const double nodeDiag = std::max(0.0, occurrenceBoundsDiagonal);
+    ExportTessellationPolicy p;
+    p.viewerTargetSse = viewerTargetSse;
+    p.nodeBoundsDiagonal = std::max(1e-9, nodeDiag);
+    p.linearMinFraction = 5.0e-3;
+    p.linearMaxFraction = 8.5e-1;
+    p.tileClass = ExportTileClass::Proxy;
+    p.qualityBias = 4.0;
+    p.angularMinDeg = 35.0;
+    p.angularMaxDeg = 120.0;
+
+    constexpr double kGeomErrFraction = 0.65;
+    constexpr double kGeomErrMinFraction = 0.25;
+    constexpr double kGeomErrMaxFraction = 0.95;
+    const double minErr = nodeDiag * kGeomErrMinFraction;
+    const double maxErr = nodeDiag * kGeomErrMaxFraction;
+    const double sseScale = std::clamp(std::max(1.0, viewerTargetSse) / 80.0, 0.75, 3.0);
+    const double rawErr = nodeDiag * kGeomErrFraction * sseScale;
+    p.tileGeometricError = std::clamp(rawErr, minErr, std::max(minErr, maxErr));
+
+    return p;
 }
 
 bool ExportTileToGlbFile(
     const std::vector<Occurrence>& occurrences,
     const std::vector<std::uint32_t>& itemIndices,
     const std::string& glbPath,
-    const float decimationFactor,
     const bool debugAppearance,
-    const double nodeBoundsDiagonal)
+    const ExportTessellationPolicy& tessellationPolicy)
 {
     Handle(TDocStd_Document) tileDoc = CreateEmptyXcafDocument();
     Handle(XCAFDoc_ShapeTool) tileShapeTool = GetShapeTool(tileDoc);
@@ -212,6 +366,7 @@ bool ExportTileToGlbFile(
     std::size_t dbgFaceColorApplied = 0;
     std::size_t dbgFaceMaterialApplied = 0;
     std::size_t dbgOccurrencesWithFaceLoop = 0;
+    std::size_t dbgFaceMappingMismatches = 0;
 
     std::size_t addedCount = 0;
     for (std::uint32_t idx : itemIndices)
@@ -285,6 +440,15 @@ bool ExportTileToGlbFile(
                     ++dbgFaceMaterialApplied;
                 }
             }
+            std::size_t destinationFaceCount = 0;
+            for (TopExp_Explorer countFaces(exportedShape, TopAbs_FACE); countFaces.More(); countFaces.Next())
+            {
+                ++destinationFaceCount;
+            }
+            if (destinationFaceCount != appearance.Faces.size())
+            {
+                ++dbgFaceMappingMismatches;
+            }
         }
 
         exportedLabels.push_back(exportedLabel);
@@ -297,43 +461,7 @@ bool ExportTileToGlbFile(
         return false;
     }
 
-    float linearDeflection = 0.05f;
-    float angularDeflectionDeg = 0.75f;
-
-    if (nodeBoundsDiagonal > 0.0)
-    {
-        const double d = std::max(1e-9, nodeBoundsDiagonal);
-
-        // Node-size-based tessellation for leaves:
-        // smaller nodes -> finer tessellation, larger nodes -> coarser tessellation.
-        constexpr double kLinearScale = 1.5e-3;
-        constexpr double kLinearMin = 5e-5;
-        constexpr double kLinearMax = 2.0;
-
-        constexpr double kAngularBase = 0.9;
-        constexpr double kAngularScale = 0.35;
-        constexpr double kAngularRefDiag = 1.0;
-        constexpr double kAngularMin = 0.35;
-        constexpr double kAngularMax = 3.0;
-
-        const double linearDefl = std::clamp(kLinearScale * d, kLinearMin, kLinearMax);
-        const double angularDefl = std::clamp(
-            kAngularBase + kAngularScale * std::log10(d / kAngularRefDiag),
-            kAngularMin,
-            kAngularMax);
-
-        linearDeflection = static_cast<float>(linearDefl);
-        angularDeflectionDeg = static_cast<float>(angularDefl);
-    }
-    else
-    {
-        const float t = ClampDecimation(decimationFactor);
-
-        // Legacy decimation-factor tessellation path.
-        // Lower t => finer mesh. Higher t => coarser proxy mesh.
-        linearDeflection = LerpClamped(0.05f, 25.0f, t);
-        angularDeflectionDeg = LerpClamped(0.75f, 12.0f, t);
-    }
+    const ExportResolvedTessellation resolved = ResolveExportTessellation(tessellationPolicy);
 
     std::size_t triCount = 0;
     for (const TDF_Label& exportedLabel : exportedLabels)
@@ -344,11 +472,15 @@ bool ExportTileToGlbFile(
             continue;
         }
 
+        // Force fresh tessellation for this export policy; otherwise prior
+        // triangulation can be reused and high/low LODs collapse to similar output.
+        BRepTools::Clean(exportedShape);
+
         BRepMesh_IncrementalMesh mesh(
             exportedShape,
-            linearDeflection,
+            resolved.linearDeflection,
             Standard_False,
-            angularDeflectionDeg,
+            resolved.angularDeflectionDeg,
             Standard_True
         );
         mesh.Perform();
@@ -371,23 +503,81 @@ bool ExportTileToGlbFile(
 
     const bool ok = writer.Perform(tileDoc, rootLabels, labelFilter, fileInfo, progress);
 
+    std::size_t exportedTriangleCount = 0;
+    std::size_t exportedMaterialCount = 0;
+    std::size_t exportedAlphaBlendCount = 0;
+    std::size_t exportedAlphaMaskCount = 0;
+    if (ok)
+    {
+        tinygltf::TinyGLTF loader;
+        tinygltf::Model gltfModel;
+        std::string warn;
+        std::string err;
+        const bool loaded = loader.LoadBinaryFromFile(&gltfModel, &err, &warn, glbPath);
+        if (loaded)
+        {
+            exportedTriangleCount = CountTrianglesInGltfModel(gltfModel);
+            exportedMaterialCount = gltfModel.materials.size();
+            for (const tinygltf::Material& material : gltfModel.materials)
+            {
+                if (material.alphaMode == "BLEND")
+                {
+                    ++exportedAlphaBlendCount;
+                }
+                else if (material.alphaMode == "MASK")
+                {
+                    ++exportedAlphaMaskCount;
+                }
+            }
+        }
+    }
+
     if (debugAppearance)
     {
         std::cout << "[AppearanceProbe:Export] glb=" << glbPath
                   << " occ=" << addedCount
+                  << " sourceTriangles=" << triCount
+                  << " glbTriangles=" << exportedTriangleCount
                   << " shapeColorApplied=" << dbgShapeColorApplied
                   << " shapeMaterialApplied=" << dbgShapeMaterialApplied
                   << " occWithFaceLoop=" << dbgOccurrencesWithFaceLoop
                   << " faceColorApplied=" << dbgFaceColorApplied
                   << " faceMaterialApplied=" << dbgFaceMaterialApplied
+                  << " faceMappingMismatches=" << dbgFaceMappingMismatches
+                  << " exportedMaterials=" << exportedMaterialCount
+                  << " alphaBlendMaterials=" << exportedAlphaBlendCount
+                  << " alphaMaskMaterials=" << exportedAlphaMaskCount
+                  << " chosenSSE=" << resolved.chosenSse
+                  << " linearDeflection=" << resolved.linearDeflection
+                  << " angularDeflectionDeg=" << resolved.angularDeflectionDeg
                   << "\n";
     }
+    AppendFidelityJsonLine(
+        "export_evidence.jsonl",
+        std::string("{\"glb\":\"") + JsonEscape(glbPath) +
+        "\",\"occurrences\":" + std::to_string(addedCount) +
+        ",\"sourceTriangles\":" + std::to_string(triCount) +
+        ",\"glbTriangles\":" + std::to_string(exportedTriangleCount) +
+        ",\"shapeColorApplied\":" + std::to_string(dbgShapeColorApplied) +
+        ",\"shapeMaterialApplied\":" + std::to_string(dbgShapeMaterialApplied) +
+        ",\"occWithFaceLoop\":" + std::to_string(dbgOccurrencesWithFaceLoop) +
+        ",\"faceColorApplied\":" + std::to_string(dbgFaceColorApplied) +
+        ",\"faceMaterialApplied\":" + std::to_string(dbgFaceMaterialApplied) +
+        ",\"faceMappingMismatches\":" + std::to_string(dbgFaceMappingMismatches) +
+        ",\"exportedMaterials\":" + std::to_string(exportedMaterialCount) +
+        ",\"alphaBlendMaterials\":" + std::to_string(exportedAlphaBlendCount) +
+        ",\"alphaMaskMaterials\":" + std::to_string(exportedAlphaMaskCount) +
+        ",\"chosenSSE\":" + std::to_string(resolved.chosenSse) +
+        ",\"linearDeflection\":" + std::to_string(resolved.linearDeflection) +
+        ",\"angularDeflectionDeg\":" + std::to_string(resolved.angularDeflectionDeg) +
+        ",\"status\":\"" + (ok ? std::string("ok") : std::string("error")) + "\"}");
 
     if (ok)
     {
         std::cout << "[ExportTile] wrote glb path=" << glbPath
                   << " items=" << itemIndices.size()
-                  << " triangles=" << triCount
+                  << " sourceTriangles=" << triCount
+                  << " glbTriangles=" << exportedTriangleCount
                   << " status=ok\n";
     }
     else

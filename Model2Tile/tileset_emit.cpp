@@ -8,31 +8,55 @@
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <map>
 #include <unordered_map>
 #include <vector>
 #include <cstdint>
 #include <system_error>
 #include <cmath>
 
-#include <Bnd_Box.hxx>
-#include <Message_ProgressRange.hxx>
-
-#include "export_glb.h"
 #include "b3dm.h"
 #include "glbopt.h"
 
 namespace
 {
-    static void GetMinMax(const Bnd_Box& b,
+    static const core::SceneInstance* FindInstanceById(
+        const core::SceneIR& sceneIr,
+        std::uint32_t id)
+    {
+        if (id < sceneIr.instances.size())
+        {
+            const core::SceneInstance& direct = sceneIr.instances[static_cast<std::size_t>(id)];
+            if (direct.id == id)
+            {
+                return &direct;
+            }
+        }
+        for (const core::SceneInstance& instance : sceneIr.instances)
+        {
+            if (instance.id == id)
+            {
+                return &instance;
+            }
+        }
+        return nullptr;
+    }
+
+    static void GetMinMax(const core::Aabb& b,
                           double& xmin, double& ymin, double& zmin,
                           double& xmax, double& ymax, double& zmax)
     {
-        b.Get(xmin, ymin, zmin, xmax, ymax, zmax);
+        xmin = b.xmin;
+        ymin = b.ymin;
+        zmin = b.zmin;
+        xmax = b.xmax;
+        ymax = b.ymax;
+        zmax = b.zmax;
     }
 
-    static double DiagonalLength(const Bnd_Box& b)
+    static double DiagonalLength(const core::Aabb& b)
     {
-        if (b.IsVoid())
+        if (!b.valid)
         {
             return 0.0;
         }
@@ -46,45 +70,24 @@ namespace
         return std::sqrt(dx * dx + dy * dy + dz * dz);
     }
 
-    static gp_Pnt ToGltfSpace(const gp_Pnt& p)
-    {
-        return gp_Pnt(p.X(), -p.Z(), p.Y());
-    }
-
-    static gp_Vec ToGltfSpace(const gp_Vec& v)
-    {
-        return gp_Vec(v.X(), -v.Z(), v.Y());
-    }
-
-    static std::array<double, 12> ToTilesBoxGltfSpace(const Bnd_Box& b)
+    static std::array<double, 12> ToTilesBoxGltfSpace(const core::Aabb& b)
     {
         double xmin, ymin, zmin, xmax, ymax, zmax;
         GetMinMax(b, xmin, ymin, zmin, xmax, ymax, zmax);
 
-        gp_Pnt cOcct(
-            (xmin + xmax) * 0.5,
-            (ymin + ymax) * 0.5,
-            (zmin + zmax) * 0.5
-        );
+        const double cx = (xmin + xmax) * 0.5;
+        const double cy = (ymin + ymax) * 0.5;
+        const double cz = (zmin + zmax) * 0.5;
 
         const double hxLen = (xmax - xmin) * 0.5;
         const double hyLen = (ymax - ymin) * 0.5;
         const double hzLen = (zmax - zmin) * 0.5;
 
-        gp_Vec hxOcct(hxLen, 0.0, 0.0);
-        gp_Vec hyOcct(0.0, hyLen, 0.0);
-        gp_Vec hzOcct(0.0, 0.0, hzLen);
-
-        gp_Pnt c = ToGltfSpace(cOcct);
-        gp_Vec hx = ToGltfSpace(hxOcct);
-        gp_Vec hy = ToGltfSpace(hyOcct);
-        gp_Vec hz = ToGltfSpace(hzOcct);
-
         return {
-            c.X(),  c.Y(),  c.Z(),
-            hx.X(), hx.Y(), hx.Z(),
-            hy.X(), hy.Y(), hy.Z(),
-            hz.X(), hz.Y(), hz.Z()
+            cx, -cz, cy,
+            hxLen, 0.0, 0.0,
+            0.0, 0.0, hyLen,
+            0.0, -hzLen, 0.0
         };
     }
 
@@ -100,14 +103,75 @@ namespace
         return false;
     }
 
+    static glbopt::Options BuildMergeOnlyGlbOptOptions()
+    {
+        glbopt::Options o;
+        o.DeduplicateMaterials = true;
+        o.Simplify = false;
+        o.OptimizeVertexCache = false;
+        o.OptimizeOverdraw = false;
+        o.OptimizeVertexFetch = false;
+        return o;
+    }
+
+    static void CollectFilteredInstanceLodPaths(
+        const std::vector<std::uint32_t>& itemIndices,
+        const core::Aabb& tileBounds,
+        double minSizeRatio,
+        const core::SceneIR& sceneIr,
+        bool useHighLod,
+        const std::string& tilesetOutDir,
+        std::vector<std::string>& outPaths)
+    {
+        outPaths.clear();
+        if (!tileBounds.valid)
+        {
+            return;
+        }
+
+        const double tileD = std::max(1e-12, DiagonalLength(tileBounds));
+
+        for (const std::uint32_t idx : itemIndices)
+        {
+            const core::SceneInstance* matchedInstance = FindInstanceById(sceneIr, idx);
+            if (!matchedInstance)
+            {
+                continue;
+            }
+
+            const std::string& p = useHighLod
+                ? matchedInstance->highLodGlbUri
+                : matchedInstance->lowLodGlbUri;
+            if (p.empty())
+            {
+                continue;
+            }
+
+            const core::Aabb& ob = matchedInstance->worldBounds;
+            if (!ob.valid)
+            {
+                continue;
+            }
+
+            const double occD = DiagonalLength(ob);
+            if (minSizeRatio > 0.0 && occD / tileD < minSizeRatio)
+            {
+                continue;
+            }
+
+            std::filesystem::path absPath = std::filesystem::path(tilesetOutDir) / p;
+            outPaths.push_back(absPath.string());
+        }
+    }
+
     static bool IsFinite(double v)
     {
         return std::isfinite(v);
     }
 
-    static bool ValidateBounds(const Bnd_Box& b, bool expectNonEmpty, const std::string& label)
+    static bool ValidateBounds(const core::Aabb& b, bool expectNonEmpty, const std::string& label)
     {
-        if (b.IsVoid())
+        if (!b.valid)
         {
             if (expectNonEmpty)
             {
@@ -208,25 +272,55 @@ namespace
         return true;
     }
 
+    static bool ValidateAppearanceCardinality(
+        const glbopt::Stats& stats,
+        bool expectNonEmpty,
+        const std::string& label)
+    {
+        if (!expectNonEmpty)
+        {
+            return true;
+        }
+        if (stats.MaterialCountInput > 0 && stats.MaterialCountCanonical == 0)
+        {
+            std::cout << "[TilesetEmit] rejected " << label
+                      << ": material cardinality collapsed to zero\n";
+            return false;
+        }
+        return true;
+    }
+
     static void AccumulateTightBounds(
         const TileOctree::Node& node,
-        const std::vector<Occurrence>& occs,
-        Bnd_Box& out)
+        const core::SceneIR& sceneIr,
+        core::Aabb& out)
     {
         for (std::uint32_t idx : node.items)
         {
-            if (idx >= occs.size())
+            const core::SceneInstance* instance = FindInstanceById(sceneIr, idx);
+            if (!instance)
             {
                 continue;
             }
 
-            const Bnd_Box& ob = occs[static_cast<std::size_t>(idx)].WorldBounds;
-            if (ob.IsVoid())
+            const core::Aabb& ob = instance->worldBounds;
+            if (!ob.valid)
             {
                 continue;
             }
-
-            out.Add(ob);
+            if (!out.valid)
+            {
+                out = ob;
+            }
+            else
+            {
+                out.xmin = std::min(out.xmin, ob.xmin);
+                out.ymin = std::min(out.ymin, ob.ymin);
+                out.zmin = std::min(out.zmin, ob.zmin);
+                out.xmax = std::max(out.xmax, ob.xmax);
+                out.ymax = std::max(out.ymax, ob.ymax);
+                out.zmax = std::max(out.zmax, ob.zmax);
+            }
         }
 
         for (const auto& c : node.children)
@@ -236,15 +330,15 @@ namespace
                 continue;
             }
 
-            AccumulateTightBounds(*c, occs, out);
+            AccumulateTightBounds(*c, sceneIr, out);
         }
     }
 
-    static Bnd_Box ComputeTightBounds(const TileOctree::Node& node, const std::vector<Occurrence>& occs)
+    static core::Aabb ComputeTightBounds(const TileOctree::Node& node, const core::SceneIR& sceneIr)
     {
-        Bnd_Box b;
-        b.SetVoid();
-        AccumulateTightBounds(node, occs, b);
+        core::Aabb b;
+        b.valid = false;
+        AccumulateTightBounds(node, sceneIr, b);
 
         return b;
     }
@@ -324,12 +418,12 @@ namespace
         const double safeNodeDiag = std::max(0.0, nodeDiag);
         const double rootStepMin = std::max(1e-12, rootDiag * 1e-9);
 
-        // Shared weld formula for both leaf and proxy meshes.
-        // Example: nodeDiag=100000 -> weldStep ~= 100.
-        constexpr double kWeldFractionOfNodeDiag = 1e-3;
+        // Position weld step: fraction of the node AABB diagonal (scale-invariant).
+        // 10x coarser than the prior 2e-5 fraction for more aggressive vertex welding.
+        constexpr double kWeldFractionOfNodeDiag = 2e-4;
 
         const double stepMin = std::max(rootStepMin, safeNodeDiag * 1e-9);
-        const double stepMax = std::max(stepMin, safeNodeDiag * 5e-3);
+        const double stepMax = std::max(stepMin, safeNodeDiag * 2e-3);
 
         return ClampDouble(
             safeNodeDiag * kWeldFractionOfNodeDiag,
@@ -346,6 +440,13 @@ namespace
         float ProxyPositionStep = 1e-5f;
         float LeafPositionStep = 1e-5f;
 
+        // glbopt attribute quantization: scale with (node diagonal / root diagonal) like
+        // tessellation and geometricError, so small tiles use proportionally finer steps.
+        float ProxyNormalStep = 1e-4f;
+        float ProxyTexcoordStep = 1e-5f;
+        float LeafNormalStep = 1e-4f;
+        float LeafTexcoordStep = 1e-6f;
+
         float ProxySimplifyRatio = 0.2f;
         float ProxySimplifyError = 1e-2f;
 
@@ -360,8 +461,8 @@ namespace
     // 2. Deeper nodes get somewhat more aggressive.
     // 3. We use this only to choose bake-time proxy settings.
     static float ComputeNodeImportance(
-        const Bnd_Box& nodeBounds,
-        const Bnd_Box& rootBounds,
+        const core::Aabb& nodeBounds,
+        const core::Aabb& rootBounds,
         int depthFromRoot,
         int maxDepth)
     {
@@ -384,11 +485,12 @@ namespace
     }
 
     static NodeTuning BuildNodeTuning(
-        const Bnd_Box& nodeBounds,
-        const Bnd_Box& rootBounds,
+        const core::Aabb& nodeBounds,
+        const core::Aabb& rootBounds,
         int depthFromRoot,
         int maxDepth,
-        bool isLeaf)
+        bool isLeaf,
+        double viewerTargetSse)
     {
         NodeTuning tuning;
 
@@ -410,6 +512,18 @@ namespace
         tuning.ProxyPositionStep = static_cast<float>(weldStep);
         tuning.LeafPositionStep = static_cast<float>(weldStep);
 
+        const double relToRoot =
+            ClampDouble(nodeDiag / rootDiag, 1e-12, 1.0e6);
+        // 10x coarser than prior (1.5e-4 / 1.0e-4) for more aggressive normal quantization.
+        tuning.LeafNormalStep = static_cast<float>(
+            ClampDouble(1.5e-3 * relToRoot, 3e-5, 2e-2));
+        tuning.ProxyNormalStep = static_cast<float>(
+            ClampDouble(1.0e-3 * relToRoot, 3e-5, 1e-2));
+        tuning.LeafTexcoordStep = static_cast<float>(
+            ClampDouble(3.0e-6 * relToRoot, 1e-9, 5e-4));
+        tuning.ProxyTexcoordStep = static_cast<float>(
+            ClampDouble(5.0e-6 * relToRoot, 1e-9, 1e-3));
+
         // Keep proxy reduction visible but less destructive than before.
         tuning.ProxySimplifyRatio =
             LerpClamped(0.42f, 0.68f, 1.0f - aggressiveness);
@@ -420,17 +534,23 @@ namespace
         tuning.LeafSimplifyRatio =
             LerpClamped(0.99f, 0.95f, leafAggressiveness);
 
-        // Geometric error model Option A:
-        // pure node-size scaling, unit-invariant across mm/miles.
+        // Geometric error model (octree-aligned):
+        // We scale geometric error from node diagonal, not with a fixed per-level
+        // multiplier. In an octree, linear size (and diagonal) tends to halve each
+        // level, so this naturally gives parent ~= 2x child error in regular regions.
+        // This avoids abrupt jumps from aggressive fixed ladders (e.g. 4x).
+        //
+        // SSE target scales this uniformly, preserving monotonic hierarchy behavior.
         if (!isLeaf)
         {
-            constexpr double kGeomErrScale = 0.4;
-            constexpr double kGeomErrMinScale = 0.12;
-            constexpr double kGeomErrMaxScale = 0.45;
+            constexpr double kGeomErrFraction = 0.25;
+            constexpr double kGeomErrMinFraction = 0.08;
+            constexpr double kGeomErrMaxFraction = 0.35;
 
-            const double minErr = nodeDiag * kGeomErrMinScale;
-            const double maxErr = nodeDiag * kGeomErrMaxScale;
-            const double rawErr = nodeDiag * kGeomErrScale;
+            const double minErr = nodeDiag * kGeomErrMinFraction;
+            const double maxErr = nodeDiag * kGeomErrMaxFraction;
+            const double sseScale = ClampDouble(std::max(1.0, viewerTargetSse) / 80.0, 0.5, 2.0);
+            const double rawErr = nodeDiag * kGeomErrFraction * sseScale;
             tuning.GeometricError = ClampDouble(rawErr, minErr, std::max(minErr, maxErr));
         }
         else
@@ -481,9 +601,9 @@ namespace
         options.OptimizeVertexFetch = false;
 
         options.PositionStep = tuning.ProxyPositionStep;
-        options.NormalStep   = 0.001f;
-        options.TexcoordStep = 0.0001f;
-        options.ColorStep    = 1.0f / 255.0f;
+        options.NormalStep = tuning.ProxyNormalStep;
+        options.TexcoordStep = tuning.ProxyTexcoordStep;
+        options.ColorStep = 1.0f / 255.0f;
 
         options.DegenerateAreaEpsilonSq = 1e-20f;
         options.Simplify = false;
@@ -508,8 +628,8 @@ namespace
 
         // Keep leaf weld conservative to reduce risk of topology damage.
         options.PositionStep = tuning.LeafPositionStep;
-        options.NormalStep = 0.005f;
-        options.TexcoordStep = 0.0001f;
+        options.NormalStep = tuning.LeafNormalStep;
+        options.TexcoordStep = tuning.LeafTexcoordStep;
         options.ColorStep = 1.0f / 255.0f;
 
         options.RemoveDegenerateByIndex = true;
@@ -530,7 +650,7 @@ namespace
     {
         std::uint32_t nodeId = 0;
         bool isLeaf = false;
-        Bnd_Box bounds;
+        core::Aabb bounds;
         std::filesystem::path GlbPath;
         std::string ContentUri;
     };
@@ -541,14 +661,29 @@ namespace
         std::unordered_map<const TileOctree::Node*, BakedNodeArtifact> artifacts;
     };
 
+    static void CollectSubtreeItemsRecursive(
+        const TileOctree::Node& node,
+        std::vector<std::uint32_t>& outItems)
+    {
+        outItems.insert(outItems.end(), node.items.begin(), node.items.end());
+        for (const auto& childPtr : node.children)
+        {
+            if (!childPtr)
+            {
+                continue;
+            }
+            CollectSubtreeItemsRecursive(*childPtr, outItems);
+        }
+    }
+
     static bool BakeLeafArtifacts(
         const TileOctree::Node& node,
-        const std::vector<Occurrence>& occurrences,
+        const core::SceneIR& sceneIr,
         const TilesetEmit::Options& opt,
         BakedNodeArtifact& artifact,
         int depthFromRoot,
         int maxDepth,
-        const Bnd_Box& rootBounds)
+        const core::Aabb& rootBounds)
     {
         const std::string baseName = opt.tileFilePrefix + std::to_string(artifact.nodeId);
         const std::filesystem::path tilesDir =
@@ -560,17 +695,21 @@ namespace
         const std::filesystem::path fullGlbPath = tilesDir / (baseName + ".glb");
         const std::filesystem::path fullB3dmPath = tilesDir / (baseName + ".b3dm");
 
-        const bool okRaw = ExportTileToGlbFile(
-            occurrences,
+        std::vector<std::string> instPaths;
+        CollectFilteredInstanceLodPaths(
             node.items,
-            rawFullGlbPath.string(),
-            0.0f,
-            opt.debugAppearance,
-            DiagonalLength(artifact.bounds));
+            artifact.bounds,
+            opt.instanceMinSizeRatio,
+            sceneIr,
+            true,
+            opt.tilesetOutDir,
+            instPaths);
 
-        if (!okRaw)
+        if (instPaths.empty())
         {
-            return false;
+            artifact.GlbPath.clear();
+            artifact.ContentUri.clear();
+            return true;
         }
 
         const NodeTuning tuning = BuildNodeTuning(
@@ -578,51 +717,107 @@ namespace
             rootBounds,
             depthFromRoot,
             maxDepth,
-            true);
+            true,
+            opt.viewerTargetSse);
 
         const glbopt::Options leafGlbOptions = BuildLeafGlbOptOptionsForNode(tuning);
-        glbopt::Stats leafGlbStats;
-        const bool okOptimize =
-            glbopt::OptimizeGlbFile(
+        glbopt::Stats mergeStats;
+        if (!glbopt::OptimizeGlbFiles(
+                instPaths,
                 rawFullGlbPath.string(),
-                fullGlbPath.string(),
-                leafGlbOptions,
-                leafGlbStats);
-
-        if (!okOptimize)
+                BuildMergeOnlyGlbOptOptions(),
+                mergeStats))
         {
             return false;
         }
 
-        const bool expectNonEmpty = node.totalTriangles > 0;
-        if (!ValidateTileGeometryStats(leafGlbStats, expectNonEmpty, baseName))
+        glbopt::Stats leafGlbStats;
+        const bool expectStats = node.totalTriangles > 0;
+        bool okOptimize = true;
+        if (opt.disableGlbopt)
         {
-            return false;
+            std::error_code copyErr;
+            std::filesystem::copy_file(
+                rawFullGlbPath,
+                fullGlbPath,
+                std::filesystem::copy_options::overwrite_existing,
+                copyErr);
+            if (copyErr)
+            {
+                return false;
+            }
+        }
+        else
+        {
+            okOptimize =
+                glbopt::OptimizeGlbFile(
+                    rawFullGlbPath.string(),
+                    fullGlbPath.string(),
+                    leafGlbOptions,
+                    leafGlbStats);
+            if (!okOptimize)
+            {
+                return false;
+            }
+            if (!ValidateTileGeometryStats(leafGlbStats, expectStats, baseName))
+            {
+                return false;
+            }
+            if (!ValidateAppearanceCardinality(leafGlbStats, expectStats, baseName))
+            {
+                return false;
+            }
         }
 
         if (opt.debugAppearance)
         {
-            const double diag = DiagonalLength(artifact.bounds);
-            const std::size_t trisIn = leafGlbStats.InputPrimitiveElementCount / 3u;
-            const std::size_t trisOut = leafGlbStats.OutputPrimitiveElementCount / 3u;
-            double reductionPct = 0.0;
-            if (trisIn > 0u)
+            if (opt.disableGlbopt)
             {
-                reductionPct = 100.0 *
-                    (1.0 - (static_cast<double>(trisOut) / static_cast<double>(trisIn)));
+                std::cout << "[LeafGlbOpt] tile=" << baseName
+                          << " glbopt=bypass (no merge/weld stats)\n";
             }
-            reductionPct = ClampDouble(reductionPct, 0.0, 100.0);
+            else
+            {
+                const double diag = DiagonalLength(artifact.bounds);
+                const std::size_t trisIn = leafGlbStats.InputPrimitiveElementCount / 3u;
+                const std::size_t trisOut = leafGlbStats.OutputPrimitiveElementCount / 3u;
+                double reductionPct = 0.0;
+                if (trisIn > 0u)
+                {
+                    reductionPct = 100.0 *
+                        (1.0 - (static_cast<double>(trisOut) / static_cast<double>(trisIn)));
+                }
+                reductionPct = ClampDouble(reductionPct, 0.0, 100.0);
 
-            std::cout << "[LeafGlbOpt] tile=" << baseName
-                      << " size=" << diag
-                      << " weld=" << leafGlbOptions.PositionStep
-                      << " tris=" << trisOut
-                      << " %" << reductionPct
-                      << "\n";
+                std::cout << "[LeafGlbOpt] tile=" << baseName
+                          << " size=" << diag
+                          << " posStep=" << leafGlbOptions.PositionStep
+                          << " vertsIn=" << leafGlbStats.InputVertexCount
+                          << " vertsOut=" << leafGlbStats.OutputVertexCount
+                          << " mergedVerts=" << leafGlbStats.MergedVertexCount
+                          << " trisIn=" << trisIn
+                          << " trisOut=" << trisOut
+                          << " triDelta%=" << reductionPct
+                          << "\n";
+            }
         }
 
+        std::string sourceLabelSample;
+        if (!node.items.empty())
+        {
+            const core::SceneInstance* instance = FindInstanceById(sceneIr, node.items.front());
+            if (instance)
+            {
+                sourceLabelSample = instance->sourceLabel;
+            }
+        }
+        const std::map<std::string, std::string> tileMetadata = {
+            { "tileId", std::to_string(artifact.nodeId) },
+            { "tileKind", "leaf" },
+            { "sourceLabelSample", sourceLabelSample }
+        };
         const bool okB3dm =
-            B3dm::WrapGlbFileToB3dmFile(fullGlbPath.string(), fullB3dmPath.string());
+            B3dm::WrapGlbFileToB3dmFile(fullGlbPath.string(), fullB3dmPath.string(), tileMetadata);
 
         if (!okB3dm)
         {
@@ -643,39 +838,19 @@ namespace
 
     static bool BakeInternalProxyArtifact(
         const TileOctree::Node& node,
+        const core::SceneIR& sceneIr,
         const TilesetEmit::Options& opt,
         BakedNodeArtifact& artifact,
-        const BakeState& bakeState,
         int depthFromRoot,
         int maxDepth,
-        const Bnd_Box& rootBounds)
+        const core::Aabb& rootBounds)
     {
-        std::vector<std::string> childGlbPaths;
-        childGlbPaths.reserve(8);
-
-        for (const auto& childPtr : node.children)
-        {
-            if (!childPtr)
-            {
-                continue;
-            }
-
-            const TileOctree::Node* child = childPtr.get();
-            std::unordered_map<const TileOctree::Node*, BakedNodeArtifact>::const_iterator it =
-                bakeState.artifacts.find(child);
-
-            if (it == bakeState.artifacts.end())
-            {
-                continue;
-            }
-
-            if (!it->second.GlbPath.empty())
-            {
-                childGlbPaths.push_back(it->second.GlbPath.string());
-            }
-        }
-
-        if (childGlbPaths.empty())
+        std::vector<std::uint32_t> proxyItems;
+        proxyItems.reserve(node.items.size() * 2u + 16u);
+        CollectSubtreeItemsRecursive(node, proxyItems);
+        std::sort(proxyItems.begin(), proxyItems.end());
+        proxyItems.erase(std::unique(proxyItems.begin(), proxyItems.end()), proxyItems.end());
+        if (proxyItems.empty())
         {
             artifact.GlbPath.clear();
             artifact.ContentUri.clear();
@@ -688,6 +863,7 @@ namespace
 
         std::filesystem::create_directories(tilesDir);
 
+        const std::filesystem::path rawProxyGlbPath = tilesDir / (baseName + "_proxy_raw.glb");
         const std::filesystem::path proxyGlbPath = tilesDir / (baseName + "_proxy.glb");
         const std::filesystem::path proxyB3dmPath = tilesDir / (baseName + "_proxy.b3dm");
 
@@ -696,55 +872,121 @@ namespace
             rootBounds,
             depthFromRoot,
             maxDepth,
-            false);
+            false,
+            opt.viewerTargetSse);
 
-        const glbopt::Options glbOptions =
-            BuildProxyGlbOptOptionsForNode(tuning);
+        std::vector<std::string> instPaths;
+        CollectFilteredInstanceLodPaths(
+            proxyItems,
+            artifact.bounds,
+            opt.instanceMinSizeRatio,
+            sceneIr,
+            false,
+            opt.tilesetOutDir,
+            instPaths);
+
+        if (instPaths.empty())
+        {
+            artifact.GlbPath.clear();
+            artifact.ContentUri.clear();
+            return true;
+        }
+
+        glbopt::Stats mergeStats;
+        if (!glbopt::OptimizeGlbFiles(
+                instPaths,
+                rawProxyGlbPath.string(),
+                BuildMergeOnlyGlbOptOptions(),
+                mergeStats))
+        {
+            return false;
+        }
 
         glbopt::Stats proxyStats;
-
-        const bool okProxyBake =
-            glbopt::OptimizeGlbFiles(childGlbPaths, proxyGlbPath.string(), glbOptions, proxyStats);
+        const glbopt::Options glbOptions = BuildProxyGlbOptOptionsForNode(tuning);
+        bool okProxyBake = true;
+        if (opt.disableGlbopt)
+        {
+            std::error_code copyErr;
+            std::filesystem::copy_file(
+                rawProxyGlbPath,
+                proxyGlbPath,
+                std::filesystem::copy_options::overwrite_existing,
+                copyErr);
+            if (copyErr)
+            {
+                return false;
+            }
+        }
+        else
+        {
+            okProxyBake =
+                glbopt::OptimizeGlbFile(rawProxyGlbPath.string(), proxyGlbPath.string(), glbOptions, proxyStats);
+        }
 
         if (opt.debugAppearance)
         {
-            const double diag = DiagonalLength(artifact.bounds);
-            const std::size_t trisIn = proxyStats.InputPrimitiveElementCount / 3u;
-            const std::size_t trisOut = proxyStats.OutputPrimitiveElementCount / 3u;
-            double reductionPct = 0.0;
-            if (trisIn > 0u)
+            if (opt.disableGlbopt)
             {
-                reductionPct = 100.0 *
-                    (1.0 - (static_cast<double>(trisOut) / static_cast<double>(trisIn)));
+                std::cout << "[ProxyGlbOpt] tile=" << baseName
+                          << " glbopt=bypass (no merge/weld stats)\n";
             }
-            reductionPct = ClampDouble(reductionPct, 0.0, 100.0);
+            else
+            {
+                const double diag = DiagonalLength(artifact.bounds);
+                const std::size_t trisIn = proxyStats.InputPrimitiveElementCount / 3u;
+                const std::size_t trisOut = proxyStats.OutputPrimitiveElementCount / 3u;
+                double reductionPct = 0.0;
+                if (trisIn > 0u)
+                {
+                    reductionPct = 100.0 *
+                        (1.0 - (static_cast<double>(trisOut) / static_cast<double>(trisIn)));
+                }
+                reductionPct = ClampDouble(reductionPct, 0.0, 100.0);
 
-            std::cout << "[ProxyGlbOpt] tile=" << baseName
-                      << " size=" << diag
-                      << " weld=" << glbOptions.PositionStep
-                      << " tris=" << trisOut
-                      << " %" << reductionPct
-                      << "\n";
+                std::cout << "[ProxyGlbOpt] tile=" << baseName
+                          << " size=" << diag
+                          << " posStep=" << glbOptions.PositionStep
+                          << " vertsIn=" << proxyStats.InputVertexCount
+                          << " vertsOut=" << proxyStats.OutputVertexCount
+                          << " mergedVerts=" << proxyStats.MergedVertexCount
+                          << " trisIn=" << trisIn
+                          << " trisOut=" << trisOut
+                          << " triDelta%=" << reductionPct
+                          << "\n";
+            }
         }
 
-        const bool expectNonEmpty = node.totalTriangles > 0;
+        const bool expectStats = node.totalTriangles > 0;
         if (!okProxyBake)
         {
             return false;
         }
 
-        const bool geometryOk =
-            ValidateTileGeometryStats(proxyStats, expectNonEmpty, baseName + "_proxy");
-        const bool reductionOk =
-            ValidateProxyReduction(proxyStats, expectNonEmpty, baseName + "_proxy");
-
-        if (!geometryOk || !reductionOk)
+        if (!opt.disableGlbopt)
         {
-            return false;
+            const bool geometryOk =
+                ValidateTileGeometryStats(proxyStats, expectStats, baseName + "_proxy");
+            const bool reductionOk =
+                ValidateProxyReduction(proxyStats, expectStats, baseName + "_proxy");
+
+            if (!geometryOk || !reductionOk)
+            {
+                return false;
+            }
+
+            if (!ValidateAppearanceCardinality(proxyStats, expectStats, baseName + "_proxy"))
+            {
+                return false;
+            }
         }
 
+        const std::map<std::string, std::string> tileMetadata = {
+            { "tileId", std::to_string(artifact.nodeId) },
+            { "tileKind", "proxy" }
+        };
         const bool okProxyB3dm =
-            B3dm::WrapGlbFileToB3dmFile(proxyGlbPath.string(), proxyB3dmPath.string());
+            B3dm::WrapGlbFileToB3dmFile(proxyGlbPath.string(), proxyB3dmPath.string(), tileMetadata);
 
         if (!okProxyB3dm)
         {
@@ -758,6 +1000,7 @@ namespace
         {
             std::error_code ec;
             std::filesystem::remove(proxyGlbPath, ec);
+            std::filesystem::remove(rawProxyGlbPath, ec);
         }
 
         return true;
@@ -765,12 +1008,12 @@ namespace
 
     static bool BakeArtifactsBottomUp(
         const TileOctree::Node& node,
-        const std::vector<Occurrence>& occurrences,
+        const core::SceneIR& sceneIr,
         const TilesetEmit::Options& opt,
         BakeState& bakeState,
         int depthFromRoot,
         int maxDepth,
-        const Bnd_Box& rootBounds)
+        const core::Aabb& rootBounds)
     {
         for (const auto& childPtr : node.children)
         {
@@ -781,7 +1024,7 @@ namespace
 
             if (!BakeArtifactsBottomUp(
                     *childPtr,
-                    occurrences,
+                    sceneIr,
                     opt,
                     bakeState,
                     depthFromRoot + 1,
@@ -799,8 +1042,8 @@ namespace
 
         if (opt.useTightBounds)
         {
-            const Bnd_Box tight = ComputeTightBounds(node, occurrences);
-            if (!tight.IsVoid())
+            const core::Aabb tight = ComputeTightBounds(node, sceneIr);
+            if (tight.valid)
             {
                 artifact.bounds = tight;
             }
@@ -820,7 +1063,7 @@ namespace
         {
             ok = BakeLeafArtifacts(
                 node,
-                occurrences,
+                sceneIr,
                 opt,
                 artifact,
                 depthFromRoot,
@@ -839,9 +1082,9 @@ namespace
             {
                 ok = BakeInternalProxyArtifact(
                     node,
+                    sceneIr,
                     opt,
                     artifact,
-                    bakeState,
                     depthFromRoot,
                     maxDepth,
                     rootBounds);
@@ -864,7 +1107,8 @@ namespace
         int depth,
         int depthFromRoot,
         int maxDepth,
-        const Bnd_Box& rootBounds,
+        double viewerTargetSse,
+        const core::Aabb& rootBounds,
         double parentGeometricError,
         bool isRoot)
     {
@@ -903,7 +1147,8 @@ namespace
                 rootBounds,
                 depthFromRoot,
                 maxDepth,
-                false);
+                false,
+                viewerTargetSse);
             geometricError = tuning.GeometricError;
             if (!isRoot && parentGeometricError > 0.0)
             {
@@ -949,6 +1194,7 @@ namespace
                     depth + 2,
                     depthFromRoot + 1,
                     maxDepth,
+                    viewerTargetSse,
                     rootBounds,
                     geometricError,
                     false);
@@ -973,18 +1219,23 @@ namespace TilesetEmit
 {
     bool EmitTilesetAndB3dm(
         const TileOctree& tree,
-        const std::vector<Occurrence>& occurrences,
         const Options& opt)
     {
         std::filesystem::create_directories(opt.tilesetOutDir);
 
+        if (!opt.sceneIr)
+        {
+            std::cerr << "[TilesetEmit] SceneIR must be provided\n";
+            return false;
+        }
+
         const int maxDepth = ComputeMaxDepth(tree.Root());
-        const Bnd_Box rootBounds = tree.Root().volume;
+        const core::Aabb rootBounds = tree.Root().volume;
 
         BakeState bakeState;
         if (!BakeArtifactsBottomUp(
                 tree.Root(),
-                occurrences,
+                *opt.sceneIr,
                 opt,
                 bakeState,
                 0,
@@ -1007,7 +1258,8 @@ namespace TilesetEmit
             rootBounds,
             0,
             maxDepth,
-            false);
+            false,
+            opt.viewerTargetSse);
         const double rootGeometricError = rootTuning.GeometricError;
 
         std::ostringstream ss;
@@ -1023,6 +1275,7 @@ namespace TilesetEmit
             2,
             0,
             maxDepth,
+            opt.viewerTargetSse,
             rootBounds,
             rootGeometricError,
             true);

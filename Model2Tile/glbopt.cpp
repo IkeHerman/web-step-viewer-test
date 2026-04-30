@@ -355,6 +355,14 @@ namespace glbopt
             const tinygltf::Material& a,
             const tinygltf::Material& b)
         {
+            const bool sensitiveAlpha =
+                (a.alphaMode == "BLEND" || a.alphaMode == "MASK" ||
+                 b.alphaMode == "BLEND" || b.alphaMode == "MASK");
+            if (sensitiveAlpha && a.name != b.name)
+            {
+                // Keep explicit transparency authored materials isolated.
+                return false;
+            }
             // Intentionally ignore material name so semantically-identical
             // materials can collapse to a shared index and merge together.
             return (a.pbrMetallicRoughness == b.pbrMetallicRoughness) &&
@@ -732,7 +740,16 @@ namespace glbopt
             return false;
         }
 
-        return internal::WriteGlb(outputModel, outputPath);
+        if (!internal::WriteGlb(outputModel, outputPath))
+        {
+            return false;
+        }
+
+        if (IsVerboseLogging())
+        {
+            internal::PrintStats(outStats, inputPath);
+        }
+        return true;
     }
 
     bool OptimizeGlbFile(
@@ -741,12 +758,7 @@ namespace glbopt
         const Options& options)
     {
         Stats stats;
-        const bool ok = OptimizeGlbFile(inputPath, outputPath, options, stats);
-        if (ok)
-        {
-            internal::PrintStats(stats, inputPath);
-        }
-        return ok;
+        return OptimizeGlbFile(inputPath, outputPath, options, stats);
     }
 
     bool OptimizeGlbFile(

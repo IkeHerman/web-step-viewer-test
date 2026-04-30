@@ -1,11 +1,37 @@
 // octree.cpp
-#include "common.h"
 #include "octree.h"
 
 #include <algorithm>
 #include <array>
 #include <iostream>
 #include <stdexcept>
+namespace {
+
+const tiler::TileItem* FindTileItemById(
+    const std::vector<tiler::TileItem>& items,
+    const std::uint32_t id)
+{
+    if (id < items.size())
+    {
+        const tiler::TileItem& candidate = items[static_cast<std::size_t>(id)];
+        if (candidate.id == id)
+        {
+            return &candidate;
+        }
+    }
+
+    for (const tiler::TileItem& item : items)
+    {
+        if (item.id == id)
+        {
+            return &item;
+        }
+    }
+
+    return nullptr;
+}
+} // namespace
+
 
 TileOctree::TileOctree()
     : TileOctree(Config())
@@ -17,7 +43,7 @@ TileOctree::TileOctree(const Config& cfg)
 {
     m_root = std::make_unique<Node>();
     m_root->depth = 0;
-    m_root->volume.SetVoid();
+    m_root->volume.valid = false;
     m_root->totalTriangles = 0;
 }
 
@@ -39,21 +65,26 @@ const TileOctree::Node& TileOctree::Root() const
     return *m_root;
 }
 
-const Bnd_Box& TileOctree::GlobalBounds() const
+const core::Aabb& TileOctree::GlobalBounds() const
 {
     return m_global;
 }
 
-void TileOctree::GetMinMax(const Bnd_Box& box,
+void TileOctree::GetMinMax(const core::Aabb& box,
                            double& xmin, double& ymin, double& zmin,
                            double& xmax, double& ymax, double& zmax)
 {
-    box.Get(xmin, ymin, zmin, xmax, ymax, zmax);
+    xmin = box.xmin;
+    ymin = box.ymin;
+    zmin = box.zmin;
+    xmax = box.xmax;
+    ymax = box.ymax;
+    zmax = box.zmax;
 }
 
-double TileOctree::MaxSideLength(const Bnd_Box& box)
+double TileOctree::MaxSideLength(const core::Aabb& box)
 {
-    if (box.IsVoid())
+    if (!box.valid)
         return 0.0;
 
     double xmin, ymin, zmin, xmax, ymax, zmax;
@@ -65,23 +96,23 @@ double TileOctree::MaxSideLength(const Bnd_Box& box)
     return std::max(sx, std::max(sy, sz));
 }
 
-int TileOctree::ChooseChildByItemCenter(const Bnd_Box& parent, const Bnd_Box& itemBounds)
+int TileOctree::ChooseChildByItemCenter(const core::Aabb& parent, const core::Aabb& itemBounds)
 {
-    if (parent.IsVoid())
+    if (!parent.valid)
         return 0;
 
     double px0, py0, pz0, px1, py1, pz1;
-    parent.Get(px0, py0, pz0, px1, py1, pz1);
+    GetMinMax(parent, px0, py0, pz0, px1, py1, pz1);
 
     const double pcx = (px0 + px1) * 0.5;
     const double pcy = (py0 + py1) * 0.5;
     const double pcz = (pz0 + pz1) * 0.5;
 
-    if (itemBounds.IsVoid())
+    if (!itemBounds.valid)
         return 0;
 
     double ix0, iy0, iz0, ix1, iy1, iz1;
-    itemBounds.Get(ix0, iy0, iz0, ix1, iy1, iz1);
+    GetMinMax(itemBounds, ix0, iy0, iz0, ix1, iy1, iz1);
 
     const double icx = (ix0 + ix1) * 0.5;
     const double icy = (iy0 + iy1) * 0.5;
@@ -94,13 +125,11 @@ int TileOctree::ChooseChildByItemCenter(const Bnd_Box& parent, const Bnd_Box& it
     return xi + (yi << 1) + (zi << 2);
 }
 
-std::array<Bnd_Box, 8> TileOctree::MakeChildVolumes(const Bnd_Box& parent, double looseFactor)
+std::array<core::Aabb, 8> TileOctree::MakeChildVolumes(const core::Aabb& parent, double looseFactor)
 {
-    std::array<Bnd_Box, 8> children;
-    for (Bnd_Box& b : children)
-        b.SetVoid();
+    std::array<core::Aabb, 8> children{};
 
-    if (parent.IsVoid())
+    if (!parent.valid)
         return children;
 
     double xmin, ymin, zmin, xmax, ymax, zmax;
@@ -118,15 +147,20 @@ std::array<Bnd_Box, 8> TileOctree::MakeChildVolumes(const Bnd_Box& parent, doubl
     const double lay = hy * looseFactor;
     const double laz = hz * looseFactor;
 
-    auto makeBox = [&](double ox, double oy, double oz) -> Bnd_Box
+    auto makeBox = [&](double ox, double oy, double oz) -> core::Aabb
     {
         const double ccx = cx + ox;
         const double ccy = cy + oy;
         const double ccz = cz + oz;
 
-        Bnd_Box b;
-        b.Update(ccx - lax, ccy - lay, ccz - laz,
-                 ccx + lax, ccy + lay, ccz + laz);
+        core::Aabb b;
+        b.xmin = ccx - lax;
+        b.ymin = ccy - lay;
+        b.zmin = ccz - laz;
+        b.xmax = ccx + lax;
+        b.ymax = ccy + lay;
+        b.zmax = ccz + laz;
+        b.valid = true;
         return b;
     };
 
@@ -142,9 +176,9 @@ std::array<Bnd_Box, 8> TileOctree::MakeChildVolumes(const Bnd_Box& parent, doubl
     return children;
 }
 
-int TileOctree::FindContainingChild(const std::array<Bnd_Box, 8>& children, const Bnd_Box& itemBounds)
+int TileOctree::FindContainingChild(const std::array<core::Aabb, 8>& children, const core::Aabb& itemBounds)
 {
-    if (itemBounds.IsVoid())
+    if (!itemBounds.valid)
         return -1;
 
     double ix0, iy0, iz0, ix1, iy1, iz1;
@@ -152,8 +186,8 @@ int TileOctree::FindContainingChild(const std::array<Bnd_Box, 8>& children, cons
 
     for (int i = 0; i < 8; ++i)
     {
-        const Bnd_Box& c = children[static_cast<std::size_t>(i)];
-        if (c.IsVoid())
+        const core::Aabb& c = children[static_cast<std::size_t>(i)];
+        if (!c.valid)
             continue;
 
         double cx0, cy0, cz0, cx1, cy1, cz1;
@@ -170,7 +204,7 @@ int TileOctree::FindContainingChild(const std::array<Bnd_Box, 8>& children, cons
     return -1;
 }
 
-void TileOctree::Build(const std::vector<Occurrence>& occurrences, Bnd_Box& globalBounds)
+void TileOctree::Build(const std::vector<tiler::TileItem>& items, const core::Aabb& globalBounds)
 {
     if (!m_root)
         m_root = std::make_unique<Node>();
@@ -185,22 +219,22 @@ void TileOctree::Build(const std::vector<Occurrence>& occurrences, Bnd_Box& glob
     m_global = globalBounds;
 
     std::vector<std::uint32_t> all;
-    all.reserve(occurrences.size());
+    all.reserve(items.size());
 
-    for (std::uint32_t i = 0; i < static_cast<std::uint32_t>(occurrences.size()); ++i)
+    for (const tiler::TileItem& item : items)
     {
-        all.push_back(i);
-        m_root->totalTriangles += occurrences[static_cast<std::size_t>(i)].TriangleCount;
+        all.push_back(item.id);
+        m_root->totalTriangles += item.triangleCount;
     }
 
-    if (all.empty() || m_global.IsVoid())
+    if (all.empty() || !m_global.valid)
         return;
 
-    BuildNode(*m_root, occurrences, all, m_root->totalTriangles);
+    BuildNode(*m_root, items, all, m_root->totalTriangles);
 }
 
 void TileOctree::BuildNode(Node& node,
-                           const std::vector<Occurrence>& occurrences,
+                           const std::vector<tiler::TileItem>& items,
                            const std::vector<std::uint32_t>& inputItems,
                            std::uint64_t inputTotalTriangles)
 {
@@ -225,7 +259,7 @@ void TileOctree::BuildNode(Node& node,
 
     node.items.clear();
 
-    const std::array<Bnd_Box, 8> childVolumes = MakeChildVolumes(node.volume, m_cfg.looseFactor);
+    const std::array<core::Aabb, 8> childVolumes = MakeChildVolumes(node.volume, m_cfg.looseFactor);
     std::array<std::vector<std::uint32_t>, 8> buckets;
     std::array<std::uint64_t, 8> bucketTriangles{};
     bucketTriangles.fill(0);
@@ -235,8 +269,12 @@ void TileOctree::BuildNode(Node& node,
 
     for (std::uint32_t idx : inputItems)
     {
-        const Occurrence& occ = occurrences[static_cast<std::size_t>(idx)];
-        const Bnd_Box& itemBox = occ.WorldBounds;
+        const tiler::TileItem* item = FindTileItemById(items, idx);
+        if (!item)
+        {
+            continue;
+        }
+        const core::Aabb& itemBox = item->worldBounds;
 
         int childIndex = FindContainingChild(childVolumes, itemBox);
         if (childIndex >= 0)
@@ -250,7 +288,7 @@ void TileOctree::BuildNode(Node& node,
         }
 
         buckets[static_cast<std::size_t>(childIndex)].push_back(idx);
-        bucketTriangles[static_cast<std::size_t>(childIndex)] += occ.TriangleCount;
+        bucketTriangles[static_cast<std::size_t>(childIndex)] += item->triangleCount;
     }
 
     bool anyChildHasItems = false;
@@ -327,7 +365,7 @@ void TileOctree::BuildNode(Node& node,
         child->depth = node.depth + 1;
         child->totalTriangles = bucketTriangles[static_cast<std::size_t>(i)];
 
-        BuildNode(*child, occurrences, bucket, child->totalTriangles);
+        BuildNode(*child, items, bucket, child->totalTriangles);
         node.children[static_cast<std::size_t>(i)] = std::move(child);
     }
 }

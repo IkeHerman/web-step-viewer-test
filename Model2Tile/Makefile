@@ -25,16 +25,18 @@ RPATH := -Wl,-rpath,$(PREFIX)/lib
 # ---- Project sources ----
 SOURCES := \
 	$(SRCDIR)/app_main.cpp \
-	$(SRCDIR)/main.cpp \
+	$(SRCDIR)/step_pipeline.cpp \
 	$(SRCDIR)/app/cli_options.cpp \
 	$(SRCDIR)/pipeline/pipeline_runner.cpp \
 	$(SRCDIR)/importers/step_importer.cpp \
+	$(SRCDIR)/importers/step_instance_lod.cpp \
+	$(SRCDIR)/importers/step_pipeline_support.cpp \
+	$(SRCDIR)/importers/step_traversal.cpp \
 	$(SRCDIR)/importers/fbx_importer.cpp \
 	$(SRCDIR)/adapters/step_to_scene_ir.cpp \
 	$(SRCDIR)/tiler/scene_ir_tile_items.cpp \
-	$(SRCDIR)/exporters/occt_tile_content_baker.cpp \
 	$(SRCDIR)/octree.cpp \
-	$(SRCDIR)/export_glb.cpp \
+	$(SRCDIR)/importers/step_glb_export.cpp \
 	$(SRCDIR)/b3dm.cpp \
 	$(SRCDIR)/tileset_emit.cpp \
 	$(SRCDIR)/tinygltf_imp.cpp \

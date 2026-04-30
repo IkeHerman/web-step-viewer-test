@@ -5,6 +5,7 @@
 #include "../importers/step_importer.h"
 
 #include <array>
+#include <iostream>
 
 int PipelineRunner::Run(const CliOptions& cli) const
 {
@@ -19,6 +20,19 @@ int PipelineRunner::Run(const CliOptions& cli) const
     {
         if (importer->Supports(cli))
         {
+            const ImportContract contract = importer->Contract();
+            if (!contract.producesSceneIr)
+            {
+                std::cerr << "[Pipeline] importer '" << importer->FormatName()
+                          << "' does not yet satisfy SceneIR primary contract\n";
+                return 2;
+            }
+            if (!contract.emitsInstanceLodUris)
+            {
+                std::cerr << "[Pipeline] importer '" << importer->FormatName()
+                          << "' does not yet satisfy instance LOD URI contract\n";
+                return 2;
+            }
             return importer->Run(cli);
         }
     }

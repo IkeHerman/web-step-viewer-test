@@ -25,6 +25,7 @@ const debugState = {
   mode: "original", // original | wireframe | normals | unlit
   doubleSided: false,
   showBounds: false,
+  preserveExportedMaterials: false,
 };
 
 const meshOriginalMaterials = new WeakMap();
@@ -47,6 +48,34 @@ let lastFrameStats = null;
 let hasLoadedAnyTile = false;
 const visibleProxyTiles = new Set();
 const visibleLeafTiles = new Set();
+
+function collectMaterialFidelityStats() {
+  const stats = {
+    meshCount: 0,
+    materialCount: 0,
+    pbrCount: 0,
+    alphaBlendCount: 0,
+    alphaMaskCount: 0,
+    vertexColorMaterialCount: 0,
+    metallicClampedCount: 0,
+  };
+  tiles.group.traverse((obj) => {
+    if (!obj.isMesh || !obj.material) return;
+    stats.meshCount++;
+    for (const material of getMaterialList(obj.material)) {
+      if (!material) continue;
+      stats.materialCount++;
+      if (material.vertexColors) stats.vertexColorMaterialCount++;
+      if (material.isMeshStandardMaterial || material.isMeshPhysicalMaterial) {
+        stats.pbrCount++;
+        if (material.transparent && material.opacity < 0.999) stats.alphaBlendCount++;
+        if (material.alphaTest > 0) stats.alphaMaskCount++;
+        if (material.userData?.fidelityMetalnessClamped) stats.metallicClampedCount++;
+      }
+    }
+  });
+  return stats;
+}
 
 function isProxyTile(tile) {
   const tileUri =
@@ -252,9 +281,11 @@ tiles.addEventListener?.("load-model", (e) => {
             !!material.metalnessMap ||
             !!material.emissiveMap;
 
-          if (!hasPbrInputs && material.metalness >= 0.95) {
+          if (!debugState.preserveExportedMaterials && !hasPbrInputs && material.metalness >= 0.95) {
             material.metalness = 0.1;
             material.roughness = Math.max(material.roughness ?? 1.0, 0.8);
+            material.userData = material.userData || {};
+            material.userData.fidelityMetalnessClamped = true;
           }
         }
 
@@ -759,6 +790,15 @@ window.addEventListener("keydown", (event) => {
     case "KeyB":
       debugState.showBounds = !debugState.showBounds;
       updateRootBoundsHelper();
+      break;
+    case "KeyM":
+      debugState.preserveExportedMaterials = !debugState.preserveExportedMaterials;
+      console.log("MATERIAL_AB_MODE", {
+        preserveExportedMaterials: debugState.preserveExportedMaterials,
+      });
+      break;
+    case "KeyV":
+      console.log("FIDELITY_VIEWER_STATS", collectMaterialFidelityStats());
       break;
     case "KeyF":
       needsGeometryRefit = true;

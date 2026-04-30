@@ -9,10 +9,15 @@ struct CliOptions
     std::string contentSubdir = "tiles";
     std::string tilePrefix = "tile_";
     std::string inputFormat = "auto";
+    std::filesystem::path fidelityArtifactsDir;
+    double viewerTargetSse = 80.0;
+    bool disableGlbopt = false;
     bool keepGlb = true;
     bool useTightBounds = true;
     bool contentOnlyAtLeaves = false;
     bool verbose = false;
+
+    double instanceMinSizeRatio = 1e-3;
 };
 
 void PrintUsage(const char* programName);

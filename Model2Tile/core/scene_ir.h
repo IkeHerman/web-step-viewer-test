@@ -28,13 +28,6 @@ struct Transform4d
     };
 };
 
-struct SceneOccurrence
-{
-    std::string sourceLabel;
-    std::uint32_t triangleCount = 0;
-    Aabb worldBounds;
-};
-
 struct ScenePrototype
 {
     std::uint32_t id = 0;
@@ -47,12 +40,14 @@ struct ScenePrototype
 
 struct SceneInstance
 {
+    std::uint32_t id = 0;
     std::string sourceLabel;
     std::uint32_t prototypeId = 0;
-    std::uint32_t occurrenceIndex = 0;
     bool fromExplicitReference = false;
     Transform4d worldTransform;
     Aabb worldBounds;
+    std::string highLodGlbUri;
+    std::string lowLodGlbUri;
 };
 
 struct SceneIR
@@ -61,11 +56,14 @@ struct SceneIR
     std::string sourceFormat;
     std::vector<ScenePrototype> prototypes;
     std::vector<SceneInstance> instances;
-    // Legacy flattened representation retained for compatibility during migration.
-    std::vector<SceneOccurrence> occurrences;
     Aabb worldBounds;
     std::uint64_t totalTriangles = 0;
     std::uint64_t explicitReferenceInstances = 0;
     std::uint64_t qualifiedDedupInstances = 0;
+    std::uint64_t shapeColorOccurrences = 0;
+    std::uint64_t shapeMaterialOccurrences = 0;
+    std::uint64_t faceColorEntries = 0;
+    std::uint64_t faceMaterialEntries = 0;
+    std::uint64_t metadataOccurrences = 0;
 };
 } // namespace core

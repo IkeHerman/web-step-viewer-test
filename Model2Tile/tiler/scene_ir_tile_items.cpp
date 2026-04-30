@@ -13,7 +13,7 @@ std::vector<TileItem> BuildTileItemsFromSceneIR(const core::SceneIR& scene)
     {
         const core::SceneInstance& source = scene.instances[i];
         TileItem item;
-        item.id = source.occurrenceIndex;
+        item.id = source.id;
         item.worldBounds = source.worldBounds;
         if (source.prototypeId < scene.prototypes.size())
         {
