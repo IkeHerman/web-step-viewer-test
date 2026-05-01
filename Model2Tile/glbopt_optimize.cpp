@@ -3,6 +3,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
+#include <cstring>
 #include <limits>
 #include <unordered_map>
 
@@ -45,7 +47,10 @@ namespace glbopt
         {
             if (step <= 0.0f)
             {
-                return static_cast<std::int64_t>(std::llround(static_cast<double>(value)));
+                std::uint32_t bits = 0;
+                static_assert(sizeof(bits) == sizeof(value), "float size must match uint32_t");
+                std::memcpy(&bits, &value, sizeof(float));
+                return static_cast<std::int64_t>(bits);
             }
 
             return static_cast<std::int64_t>(std::llround(static_cast<double>(value / step)));
@@ -187,6 +192,73 @@ namespace glbopt
             return mode == TINYGLTF_MODE_TRIANGLES;
         }
 
+        static void CullInvalidIndexReferences(PrimitiveData& ioData, Stats& stats)
+        {
+            if (ioData.Indices.empty())
+            {
+                return;
+            }
+
+            const std::size_t vertexCount = ioData.Vertices.size();
+            if (vertexCount == 0)
+            {
+                ioData.Indices.clear();
+                return;
+            }
+
+            if (ioData.Mode == TINYGLTF_MODE_TRIANGLES)
+            {
+                std::vector<std::uint32_t> filtered;
+                filtered.reserve(ioData.Indices.size());
+                for (std::size_t i = 0; i + 2 < ioData.Indices.size(); i += 3)
+                {
+                    const std::uint32_t a = ioData.Indices[i + 0];
+                    const std::uint32_t b = ioData.Indices[i + 1];
+                    const std::uint32_t c = ioData.Indices[i + 2];
+                    if (a >= vertexCount || b >= vertexCount || c >= vertexCount)
+                    {
+                        ++stats.DroppedTrianglesInvalidIndices;
+                        continue;
+                    }
+                    filtered.push_back(a);
+                    filtered.push_back(b);
+                    filtered.push_back(c);
+                }
+                ioData.Indices.swap(filtered);
+                return;
+            }
+
+            if (ioData.Mode == TINYGLTF_MODE_LINE)
+            {
+                std::vector<std::uint32_t> filtered;
+                filtered.reserve(ioData.Indices.size());
+                for (std::size_t i = 0; i + 1 < ioData.Indices.size(); i += 2)
+                {
+                    const std::uint32_t a = ioData.Indices[i + 0];
+                    const std::uint32_t b = ioData.Indices[i + 1];
+                    if (a >= vertexCount || b >= vertexCount)
+                    {
+                        continue;
+                    }
+                    filtered.push_back(a);
+                    filtered.push_back(b);
+                }
+                ioData.Indices.swap(filtered);
+                return;
+            }
+
+            std::vector<std::uint32_t> filtered;
+            filtered.reserve(ioData.Indices.size());
+            for (const std::uint32_t idx : ioData.Indices)
+            {
+                if (idx < vertexCount)
+                {
+                    filtered.push_back(idx);
+                }
+            }
+            ioData.Indices.swap(filtered);
+        }
+
         static void WeldVertices(
             PrimitiveData& ioData,
             const Options& options,
@@ -229,6 +301,12 @@ namespace glbopt
 
             for (std::uint32_t& idx : ioData.Indices)
             {
+                if (idx >= remap.size() || remap[idx] == std::numeric_limits<std::uint32_t>::max())
+                {
+                    ++stats.DroppedIndicesInvalidRemap;
+                    idx = 0;
+                    continue;
+                }
                 idx = remap[idx];
             }
 
@@ -479,6 +557,7 @@ namespace glbopt
             const Options& options,
             Stats& stats)
         {
+            CullInvalidIndexReferences(ioData, stats);
             if (options.StripColor0Always)
             {
                 StripVertexColor0(ioData);

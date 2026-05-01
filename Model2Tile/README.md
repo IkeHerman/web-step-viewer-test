@@ -1,6 +1,6 @@
 # Model2Tile
 
-Convert supported CAD input formats (currently STEP; FBX routed but pending implementation)
+Convert supported CAD input formats (STEP and static-mesh FBX)
 into a 3D Tiles tileset (`tileset.json` + `.b3dm` content).
 
 ## Quick Start
@@ -24,6 +24,12 @@ make
 ```
 
 This builds the `model2tile` executable.
+
+### FBX build dependency
+
+FBX import uses Assimp. If Assimp headers/libs are available at `ASSIMP_PREFIX`
+(default `/opt/homebrew/opt/assimp`), the FBX traversal path is compiled with parsing support.
+Without Assimp, the binary still builds but FBX traversal reports a dependency error at runtime.
 
 ## Command Line Usage
 
@@ -112,6 +118,12 @@ This builds the `model2tile` executable.
   ../source_data/model.step
 ```
 
+### 6) Single FBX file
+
+```bash
+./model2tile --input-format fbx ../source_data/model.fbx
+```
+
 ## Typical Output Structure
 
 For `--out-dir ./out/tileset` and default `--content-subdir tiles`:
@@ -126,6 +138,24 @@ out/tileset/
 ```
 
 (If `--keep-glb` is enabled, intermediate `.glb` files are also kept.)
+
+For both STEP and FBX paths, per-instance intermediate LOD files are emitted under:
+
+```text
+out/tileset/instance_lods/
+  occ_0_high.glb
+  occ_0_low.glb
+  occ_1_high.glb
+  occ_1_low.glb
+  ...
+```
+
+## FBX Scope (first pass)
+
+- Preserves FBX node instances (shared meshes produce multiple SceneIR instances with unique transforms).
+- Performs conservative prototype dedup using geometry+material signatures.
+- Generates the same `instance_lods/occ_<i>_{high|low}.glb` intermediate naming used by STEP.
+- Current scope is static meshes and transforms only (no animation/skinning pipeline yet).
 
 ## Fidelity Regression Gate
 

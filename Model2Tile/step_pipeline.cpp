@@ -280,7 +280,6 @@ int RunStepPipeline(const CliOptions& cli)
         cfg.verbose = cli.verbose;
 
         std::vector<std::string> instanceHighGlbUris;
-        std::vector<std::string> instanceLowGlbUris;
         const std::string lodUriPrefix = "instance_lods";
         const std::filesystem::path lodDir =
             std::filesystem::path(cli.outDir) / lodUriPrefix;
@@ -291,8 +290,7 @@ int RunStepPipeline(const CliOptions& cli)
                 lodDir.string(),
                 lodUriPrefix,
                 cli.verbose,
-                instanceHighGlbUris,
-                instanceLowGlbUris))
+                instanceHighGlbUris))
         {
             return 1;
         }
@@ -302,7 +300,7 @@ int RunStepPipeline(const CliOptions& cli)
             occurrences,
             globalBoundsAabb,
             &instanceHighGlbUris,
-            &instanceLowGlbUris);
+            nullptr);
         if (!importers::ValidateSceneIrInstanceIds(sceneIr, g_verboseLogging, true))
         {
             return 1;

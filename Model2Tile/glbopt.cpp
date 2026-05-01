@@ -1,5 +1,6 @@
 #include "glbopt_internal.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <functional>
@@ -72,6 +73,22 @@ namespace glbopt
                 }
             }
 
+            return false;
+        }
+
+        bool ModelUsesTexcoord0(const tinygltf::Model& model)
+        {
+            for (const tinygltf::Mesh& mesh : model.meshes)
+            {
+                for (const tinygltf::Primitive& prim : mesh.primitives)
+                {
+                    const auto it = prim.attributes.find("TEXCOORD_0");
+                    if (it != prim.attributes.end() && it->second >= 0)
+                    {
+                        return true;
+                    }
+                }
+            }
             return false;
         }
     }
@@ -309,6 +326,34 @@ namespace glbopt
             }
         }
 
+        static double LinearDeterminant(const Mat4& m)
+        {
+            const double l00 = m.m[0];
+            const double l01 = m.m[4];
+            const double l02 = m.m[8];
+            const double l10 = m.m[1];
+            const double l11 = m.m[5];
+            const double l12 = m.m[9];
+            const double l20 = m.m[2];
+            const double l21 = m.m[6];
+            const double l22 = m.m[10];
+            return l00 * (l11 * l22 - l12 * l21) -
+                   l01 * (l10 * l22 - l12 * l20) +
+                   l02 * (l10 * l21 - l11 * l20);
+        }
+
+        static void FlipTriangleWinding(internal::PrimitiveData& ioPrimitive)
+        {
+            if (ioPrimitive.Mode != TINYGLTF_MODE_TRIANGLES)
+            {
+                return;
+            }
+            for (std::size_t i = 0; i + 2 < ioPrimitive.Indices.size(); i += 3)
+            {
+                std::swap(ioPrimitive.Indices[i + 1], ioPrimitive.Indices[i + 2]);
+            }
+        }
+
         static double QuantizeDouble(double value, double step)
         {
             if (step <= 0.0)
@@ -459,12 +504,16 @@ namespace glbopt
             ++ioStats.PrimitiveCountSeen;
 
             internal::PrimitiveData extracted;
-            if (!internal::ExtractPrimitive(sourceModel, primitive, extracted))
+            if (!internal::ExtractPrimitive(sourceModel, primitive, extracted, &ioStats))
             {
                 return true;
             }
 
             ApplyTransformToPrimitive(extracted, world);
+            if (LinearDeterminant(world) < 0.0)
+            {
+                FlipTriangleWinding(extracted);
+            }
 
             if (primitive.material >= 0)
             {
@@ -523,7 +572,16 @@ namespace glbopt
             internal::MergeUniqueStrings(destinationModel.extensionsUsed, sourceModel.extensionsUsed);
             internal::MergeUniqueStrings(destinationModel.extensionsRequired, sourceModel.extensionsRequired);
 
-            internal::DeepCopyContext copyContext{ sourceModel, destinationModel };
+            internal::DeepCopyContext copyContext{
+                sourceModel,
+                destinationModel,
+                {},
+                {},
+                {},
+                {},
+                {},
+                {}
+            };
 
             ioStats.MeshCount += sourceModel.meshes.size();
 
@@ -709,7 +767,7 @@ namespace glbopt
         }
 
         Options effectiveOptions = options;
-        if (!ModelUsesAnyTexture(sourceModel))
+        if (!ModelUsesAnyTexture(sourceModel) && !ModelUsesTexcoord0(sourceModel))
         {
             effectiveOptions.WeldTexcoord0 = false;
         }
@@ -784,6 +842,7 @@ namespace glbopt
 
         Stats combinedStats{};
         bool anyTextureInInputs = false;
+        bool anyTexcoordInInputs = false;
 
         tinygltf::Model outputModel;
         outputModel.asset.version = "2.0";
@@ -800,6 +859,8 @@ namespace glbopt
             }
 
             anyTextureInInputs = anyTextureInInputs || ModelUsesAnyTexture(sourceModel);
+            anyTexcoordInInputs =
+                anyTexcoordInInputs || ModelUsesTexcoord0(sourceModel);
 
             if (options.DeduplicateMaterials)
             {
@@ -813,7 +874,7 @@ namespace glbopt
         }
 
         Options effectiveOptions = options;
-        if (!anyTextureInInputs)
+        if (!anyTextureInInputs && !anyTexcoordInInputs)
         {
             effectiveOptions.WeldTexcoord0 = false;
         }

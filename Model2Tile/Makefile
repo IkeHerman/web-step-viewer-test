@@ -19,8 +19,43 @@ CXXFLAGS += -Wno-missing-field-initializers
 
 # ---- Linker / OCCT libs ----
 LDFLAGS ?= -L$(PREFIX)/lib
-LIBS ?= -lTKernel -lTKStd -lTKStdL -lTKXSBase -lTKLCAF -lTKDE -lTKDEGLTF -lTKRWMesh -lTKMesh -lTKBRep -lTKPrim -lTKCDF -lTKDCAF -lTKDESTEP -lTKGeomAlgo -lTKGeomBase -lTKMath -lTKService -lTKTopAlgo -lTKXCAF -lTKG2d -lTKG3d
-RPATH := -Wl,-rpath,$(PREFIX)/lib
+ASSIMP_INCLUDE_DIR :=
+ASSIMP_LIB_DIR :=
+ASSIMP_INCLUDE_DIR_2 :=
+ifneq ("$(wildcard $(DEPDIR)/assimp/install/include/assimp/Importer.hpp)","")
+ASSIMP_INCLUDE_DIR := $(DEPDIR)/assimp/install/include
+ASSIMP_LIB_DIR := $(DEPDIR)/assimp/install/lib
+else ifneq ("$(wildcard $(DEPDIR)/assimp/include/assimp/Importer.hpp)","")
+ifneq ("$(wildcard $(DEPDIR)/assimp/build/bin/libassimp.dylib)","")
+ASSIMP_INCLUDE_DIR := $(DEPDIR)/assimp/include
+ASSIMP_INCLUDE_DIR_2 := $(DEPDIR)/assimp/build/include
+ASSIMP_LIB_DIR := $(DEPDIR)/assimp/build/bin
+endif
+else ifneq ("$(wildcard /opt/homebrew/opt/assimp/include/assimp/Importer.hpp)","")
+ASSIMP_INCLUDE_DIR := /opt/homebrew/opt/assimp/include
+ASSIMP_LIB_DIR := /opt/homebrew/opt/assimp/lib
+endif
+
+ASSIMP_CXXFLAGS :=
+ASSIMP_LDFLAGS :=
+ASSIMP_LIBS :=
+ASSIMP_RPATH :=
+ifneq ("$(ASSIMP_INCLUDE_DIR)","")
+ASSIMP_CXXFLAGS := -isystem $(ASSIMP_INCLUDE_DIR)
+ifneq ("$(ASSIMP_INCLUDE_DIR_2)","")
+ASSIMP_CXXFLAGS += -isystem $(ASSIMP_INCLUDE_DIR_2)
+endif
+endif
+ifneq ("$(ASSIMP_LIB_DIR)","")
+ASSIMP_LDFLAGS := -L$(ASSIMP_LIB_DIR)
+ASSIMP_LIBS := -lassimp
+ASSIMP_RPATH := -Wl,-rpath,$(abspath $(ASSIMP_LIB_DIR))
+endif
+
+CXXFLAGS += $(ASSIMP_CXXFLAGS)
+LDFLAGS += $(ASSIMP_LDFLAGS)
+LIBS ?= -lTKernel -lTKStd -lTKStdL -lTKXSBase -lTKLCAF -lTKDE -lTKDEGLTF -lTKRWMesh -lTKMesh -lTKBRep -lTKPrim -lTKCDF -lTKDCAF -lTKDESTEP -lTKGeomAlgo -lTKGeomBase -lTKMath -lTKService -lTKTopAlgo -lTKXCAF -lTKG2d -lTKG3d $(ASSIMP_LIBS)
+RPATH := -Wl,-rpath,$(PREFIX)/lib $(ASSIMP_RPATH)
 
 # ---- Project sources ----
 SOURCES := \
@@ -33,7 +68,11 @@ SOURCES := \
 	$(SRCDIR)/importers/step_pipeline_support.cpp \
 	$(SRCDIR)/importers/step_traversal.cpp \
 	$(SRCDIR)/importers/fbx_importer.cpp \
+	$(SRCDIR)/importers/fbx_traversal.cpp \
+	$(SRCDIR)/importers/fbx_instance_lod.cpp \
 	$(SRCDIR)/adapters/step_to_scene_ir.cpp \
+	$(SRCDIR)/adapters/fbx_to_scene_ir.cpp \
+	$(SRCDIR)/fbx_pipeline.cpp \
 	$(SRCDIR)/tiler/scene_ir_tile_items.cpp \
 	$(SRCDIR)/octree.cpp \
 	$(SRCDIR)/importers/step_glb_export.cpp \

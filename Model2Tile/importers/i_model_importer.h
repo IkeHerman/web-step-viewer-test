@@ -9,7 +9,7 @@ struct ImportContract
     // Importers are expected to produce SceneIR as the primary intermediate
     // artifact used by tiling/export orchestration.
     bool producesSceneIr = true;
-    // Importers should pre-bake per-instance high/low GLBs and attach URIs on instances.
+    // Importers should pre-bake per-instance high GLBs and attach URIs on instances.
     bool emitsInstanceLodUris = true;
 };
 

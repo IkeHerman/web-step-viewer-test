@@ -53,6 +53,9 @@ private:
 
     static std::array<core::Aabb, 8> MakeChildVolumes(const core::Aabb& parent, double looseFactor);
 
+    /// Returns child index only if that one child strictly contains itemBounds; otherwise -1.
+    /// With loose overlapping octants, multiple children often contain the same small AABB; returning
+    /// the first match would pack almost everything into bucket 0 and abort subdivision as "ineffective".
     static int FindContainingChild(const std::array<core::Aabb, 8>& children,
                                    const core::Aabb& itemBounds);
 

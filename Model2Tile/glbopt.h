@@ -12,6 +12,9 @@ namespace glbopt
     {
         bool DeduplicateMaterials = true;
 
+        // Fidelity-first default: keep weld checks enabled for position/normal/uv/color.
+        // OptimizeGlbFile(s) only forces WeldTexcoord0=false when neither materials use
+        // textures nor meshes carry TEXCOORD_0 (welding positions without UV keys would merge seams).
         bool WeldPositions = true;
         bool WeldNormals = true;
         bool WeldTexcoord0 = true;
@@ -60,6 +63,10 @@ namespace glbopt
 
         std::size_t DroppedDegenerateById = 0;
         std::size_t DroppedDegenerateByArea = 0;
+        std::size_t DroppedTrianglesInvalidIndices = 0;
+        std::size_t DroppedPrimitivesInvalidAccessor = 0;
+        std::size_t DroppedPrimitivesInvalidIndices = 0;
+        std::size_t DroppedIndicesInvalidRemap = 0;
         std::size_t SimplifiedIndexCount = 0;
     };
 

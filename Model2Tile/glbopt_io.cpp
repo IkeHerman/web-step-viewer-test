@@ -5,6 +5,7 @@
 #include <cstring>
 #include <filesystem>
 #include <iostream>
+#include <limits>
 
 namespace glbopt
 {
@@ -56,18 +57,50 @@ namespace glbopt
 
             const int componentCount = ComponentCountForType(accessor.type);
             const std::size_t componentSize = ComponentSizeInBytes(accessor.componentType);
+            if (componentCount <= 0 || componentSize == 0)
+            {
+                return nullptr;
+            }
             const std::size_t packedSize = static_cast<std::size_t>(componentCount) * componentSize;
+            if (packedSize == 0)
+            {
+                return nullptr;
+            }
 
             outStride = accessor.ByteStride(view);
             if (outStride == 0)
             {
                 outStride = packedSize;
             }
+            if (outStride < packedSize)
+            {
+                return nullptr;
+            }
 
             const std::size_t offset = view.byteOffset + accessor.byteOffset;
             if (offset >= buffer.data.size())
             {
                 return nullptr;
+            }
+
+            const std::size_t count = static_cast<std::size_t>(accessor.count);
+            if (count > 0)
+            {
+                const std::size_t maxBeforeMul = std::numeric_limits<std::size_t>::max() / outStride;
+                if ((count - 1u) > maxBeforeMul)
+                {
+                    return nullptr;
+                }
+                const std::size_t lastOffset = (count - 1u) * outStride;
+                if (lastOffset > (std::numeric_limits<std::size_t>::max() - packedSize))
+                {
+                    return nullptr;
+                }
+                const std::size_t span = lastOffset + packedSize;
+                if (span > (buffer.data.size() - offset))
+                {
+                    return nullptr;
+                }
             }
 
             return buffer.data.data() + offset;
@@ -214,17 +247,26 @@ namespace glbopt
         bool ExtractPrimitive(
             const tinygltf::Model& model,
             const tinygltf::Primitive& primitive,
-            PrimitiveData& outData)
+            PrimitiveData& outData,
+            Stats* ioStats)
         {
             const auto posIt = primitive.attributes.find("POSITION");
             if (posIt == primitive.attributes.end())
             {
+                if (ioStats)
+                {
+                    ++ioStats->DroppedPrimitivesInvalidAccessor;
+                }
                 return false;
             }
 
             std::vector<float> positions;
             if (!ReadFloatAccessor(model, posIt->second, positions, 3))
             {
+                if (ioStats)
+                {
+                    ++ioStats->DroppedPrimitivesInvalidAccessor;
+                }
                 return false;
             }
 
@@ -265,7 +307,22 @@ namespace glbopt
 
             if (!ReadIndicesOrGenerateSequential(model, primitive, vertexCount, outData.Indices))
             {
+                if (ioStats)
+                {
+                    ++ioStats->DroppedPrimitivesInvalidAccessor;
+                }
                 return false;
+            }
+            for (const std::uint32_t idx : outData.Indices)
+            {
+                if (idx >= vertexCount)
+                {
+                    if (ioStats)
+                    {
+                        ++ioStats->DroppedPrimitivesInvalidIndices;
+                    }
+                    return false;
+                }
             }
 
             outData.Vertices.resize(vertexCount);
@@ -379,6 +436,10 @@ namespace glbopt
                       << " mergedVerts=" << stats.MergedVertexCount
                       << " trisIn=" << trisIn
                       << " trisOut=" << trisOut
+                      << " badPrimAccessor=" << stats.DroppedPrimitivesInvalidAccessor
+                      << " badPrimIndices=" << stats.DroppedPrimitivesInvalidIndices
+                      << " badTriIndices=" << stats.DroppedTrianglesInvalidIndices
+                      << " badIdxRemap=" << stats.DroppedIndicesInvalidRemap
                       << " " << roundedPct << "% " << changeWord
                       << "\n";
         }

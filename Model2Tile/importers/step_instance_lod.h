@@ -9,9 +9,7 @@
 
 namespace importers
 {
-// STEP-specific pre-bake:
-// Builds high/low GLBs for each STEP occurrence and returns URIs parallel to
-// occurrence order.
+/// Builds one tessellated high GLB per STEP occurrence (no separate low LOD).
 bool BakeStepInstanceLods(
     const std::vector<Occurrence>& occurrences,
     const Bnd_Box& rootBounds,
@@ -19,6 +17,5 @@ bool BakeStepInstanceLods(
     const std::string& outputDirectory,
     const std::string& outputUriPrefix,
     bool debugAppearance,
-    std::vector<std::string>& outHighGlbUris,
-    std::vector<std::string>& outLowGlbUris);
+    std::vector<std::string>& outHighGlbUris);
 } // namespace importers

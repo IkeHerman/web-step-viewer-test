@@ -78,13 +78,11 @@ function collectMaterialFidelityStats() {
 }
 
 function isProxyTile(tile) {
-  const tileUri =
-    tile?.content?.uri ||
-    tile?.content?.url ||
-    tile?.contentUrl ||
-    "";
-
-  return /_proxy\.b3dm(?:$|[?#])/i.test(`${tileUri}`);
+  // Proxy/internal tiles are nodes that have children and also carry content.
+  // Leaf tiles carry content but have no children.
+  const childCount = Array.isArray(tile?.children) ? tile.children.length : 0;
+  const hasContent = !!(tile?.content?.uri || tile?.content?.url || tile?.contentUrl);
+  return hasContent && childCount > 0;
 }
 
 const geometryDebug = {
@@ -216,14 +214,6 @@ controls.autoForward = false;
 scene.add(new THREE.HemisphereLight(0xffffff, 0x222233, 0.8));
 scene.add(new THREE.AmbientLight(0xffffff, 0.35));
 
-const key = new THREE.DirectionalLight(0xffffff, 1.8);
-key.position.set(5, 8, 3);
-scene.add(key);
-
-const fill = new THREE.DirectionalLight(0xffffff, 0.9);
-fill.position.set(-6, 3, -4);
-scene.add(fill);
-
 // ----------------------------------------------------
 // 3D Tiles
 // ----------------------------------------------------
@@ -247,9 +237,7 @@ if (FORCE_NON_PROXY_CONTENT) {
   const manager = tiles.manager || tiles.loadingManager;
   if (manager?.setURLModifier) {
     manager.setURLModifier((url) => {
-      if (/_proxy\.b3dm$/i.test(url)) {
-        return url.replace(/_proxy\.b3dm$/i, ".b3dm");
-      }
+      // With unified naming there is no proxy-specific suffix anymore.
       return url;
     });
   }

@@ -103,23 +103,11 @@ namespace
         return false;
     }
 
-    static glbopt::Options BuildMergeOnlyGlbOptOptions()
-    {
-        glbopt::Options o;
-        o.DeduplicateMaterials = true;
-        o.Simplify = false;
-        o.OptimizeVertexCache = false;
-        o.OptimizeOverdraw = false;
-        o.OptimizeVertexFetch = false;
-        return o;
-    }
-
     static void CollectFilteredInstanceLodPaths(
         const std::vector<std::uint32_t>& itemIndices,
         const core::Aabb& tileBounds,
         double minSizeRatio,
         const core::SceneIR& sceneIr,
-        bool useHighLod,
         const std::string& tilesetOutDir,
         std::vector<std::string>& outPaths)
     {
@@ -139,9 +127,7 @@ namespace
                 continue;
             }
 
-            const std::string& p = useHighLod
-                ? matchedInstance->highLodGlbUri
-                : matchedInstance->lowLodGlbUri;
+            const std::string& p = matchedInstance->highLodGlbUri;
             if (p.empty())
             {
                 continue;
@@ -573,45 +559,36 @@ namespace
         return tuning;
     }
 
-    static glbopt::Options BuildProxyGlbOptOptionsForNode(const NodeTuning& tuning)
+    /// Combine multiple instance GLBs into one buffer; weld + degenerate cleanup with node-scaled quantization.
+    /// Merge uses bitwise TEXCOORD keys (`TexcoordStep` 0) so seams stay distinct unless UVs match exactly.
+    static glbopt::Options BuildMergedInstanceGlbOptOptions(const NodeTuning& tuning, bool mergeFeedsLeafTile)
     {
-        glbopt::Options options;
+        glbopt::Options o;
 
-        // Keep proxy reduction deterministic; avoid cross-material collapsing.
-        options.DeduplicateMaterials = true;
+        const float leafOrProxyNormalStep =
+            mergeFeedsLeafTile ? tuning.LeafNormalStep : tuning.ProxyNormalStep;
 
-        // Keep position welding enabled for proxies to avoid ballooning duplicated
-        // vertices across merged child content.
-        options.WeldPositions = true;
-        options.WeldNormals = false;
-        options.WeldTexcoord0 = false;
-        options.WeldColor0 = false;
-        // Preserve source vertex colors in proxy tiles. Some CAD exports rely on
-        // COLOR_0 when explicit glTF material bindings are sparse or missing.
-        options.DropAllBlackColor0 = false;
-        options.StripColor0Always = false;
-        options.ForceDefaultMaterialForMissing = true;
-        options.ForceDoubleSidedMaterials = false;
+        o.DeduplicateMaterials = true;
+        o.WeldPositions = true;
+        o.WeldNormals = true;
+        o.WeldTexcoord0 = true;
+        o.WeldColor0 = true;
 
-        options.RemoveDegenerateByIndex = true;
-        options.RemoveDegenerateByArea = true;
+        // Proxy vs leaf share the same positional weld quantization from BuildNodeTuning.
+        o.PositionStep = tuning.LeafPositionStep;
+        o.NormalStep = leafOrProxyNormalStep;
+        o.TexcoordStep = 0.0f;
+        o.ColorStep = 1.0f / 255.0f;
 
-        options.OptimizeVertexCache = false;
-        options.OptimizeOverdraw = false;
-        options.OptimizeVertexFetch = false;
+        o.RemoveDegenerateByIndex = true;
+        o.RemoveDegenerateByArea = true;
+        o.DegenerateAreaEpsilonSq = 1e-20f;
 
-        options.PositionStep = tuning.ProxyPositionStep;
-        options.NormalStep = tuning.ProxyNormalStep;
-        options.TexcoordStep = tuning.ProxyTexcoordStep;
-        options.ColorStep = 1.0f / 255.0f;
-
-        options.DegenerateAreaEpsilonSq = 1e-20f;
-        options.Simplify = false;
-        options.SimplifyRatio = tuning.ProxySimplifyRatio;
-        options.SimplifyError = tuning.ProxySimplifyError;
-        options.OverdrawThreshold = 1.05f;
-
-        return options;
+        o.Simplify = false;
+        o.OptimizeVertexCache = true;
+        o.OptimizeOverdraw = false;
+        o.OptimizeVertexFetch = true;
+        return o;
     }
 
     static glbopt::Options BuildLeafGlbOptOptionsForNode(const NodeTuning& tuning)
@@ -619,29 +596,29 @@ namespace
         glbopt::Options options;
 
         options.DeduplicateMaterials = true;
-
         options.WeldPositions = true;
         options.WeldNormals = true;
         options.WeldTexcoord0 = true;
         options.WeldColor0 = true;
         options.ForceDoubleSidedMaterials = false;
 
-        // Keep leaf weld conservative to reduce risk of topology damage.
         options.PositionStep = tuning.LeafPositionStep;
         options.NormalStep = tuning.LeafNormalStep;
-        options.TexcoordStep = tuning.LeafTexcoordStep;
+        // Bitwise TEXCOORD weld keys — welding still runs; UVs participate as exact floats.
+        options.TexcoordStep = 0.0f;
         options.ColorStep = 1.0f / 255.0f;
 
         options.RemoveDegenerateByIndex = true;
         options.RemoveDegenerateByArea = true;
 
-        options.Simplify = true;
+        // Mesh simplification off: weld/merge/degenerate cleanup only (easier to isolate bad triangles).
+        options.Simplify = false;
         options.SimplifyRatio = tuning.LeafSimplifyRatio;
         options.SimplifyError = tuning.LeafSimplifyError;
 
-        options.OptimizeVertexCache = false;
+        options.OptimizeVertexCache = true;
         options.OptimizeOverdraw = false;
-        options.OptimizeVertexFetch = false;
+        options.OptimizeVertexFetch = true;
 
         return options;
     }
@@ -661,18 +638,48 @@ namespace
         std::unordered_map<const TileOctree::Node*, BakedNodeArtifact> artifacts;
     };
 
-    static void CollectSubtreeItemsRecursive(
+    static void CollectDescendantLeafOptimizedGlbPaths(
         const TileOctree::Node& node,
-        std::vector<std::uint32_t>& outItems)
+        const BakeState& bakeState,
+        std::vector<std::string>& outPaths)
     {
-        outItems.insert(outItems.end(), node.items.begin(), node.items.end());
+        if (!HasAnyChild(node))
+        {
+            const auto it = bakeState.artifacts.find(&node);
+            if (it != bakeState.artifacts.end() && !it->second.GlbPath.empty())
+            {
+                outPaths.push_back(it->second.GlbPath.string());
+            }
+            return;
+        }
         for (const auto& childPtr : node.children)
         {
             if (!childPtr)
             {
                 continue;
             }
-            CollectSubtreeItemsRecursive(*childPtr, outItems);
+            CollectDescendantLeafOptimizedGlbPaths(*childPtr, bakeState, outPaths);
+        }
+    }
+
+    static void ScaleGlboptAggression(glbopt::Options& o, float factor)
+    {
+        if (!(factor > 1.0f))
+        {
+            return;
+        }
+        o.PositionStep *= factor;
+        o.NormalStep *= factor;
+        if (o.TexcoordStep > 0.0f)
+        {
+            o.TexcoordStep *= factor;
+        }
+        o.ColorStep *= factor;
+        o.SimplifyError *= factor;
+        if (o.Simplify && o.SimplifyRatio < 1.0f)
+        {
+            const float r = o.SimplifyRatio;
+            o.SimplifyRatio = std::max(0.01f, r - (1.0f - r) * (factor - 1.0f));
         }
     }
 
@@ -701,7 +708,6 @@ namespace
             artifact.bounds,
             opt.instanceMinSizeRatio,
             sceneIr,
-            true,
             opt.tilesetOutDir,
             instPaths);
 
@@ -725,7 +731,7 @@ namespace
         if (!glbopt::OptimizeGlbFiles(
                 instPaths,
                 rawFullGlbPath.string(),
-                BuildMergeOnlyGlbOptOptions(),
+                BuildMergedInstanceGlbOptOptions(tuning, true),
                 mergeStats))
         {
             return false;
@@ -733,8 +739,9 @@ namespace
 
         glbopt::Stats leafGlbStats;
         const bool expectStats = node.totalTriangles > 0;
+        const bool bypassLeafGlbopt = opt.disableGlbopt;
         bool okOptimize = true;
-        if (opt.disableGlbopt)
+        if (bypassLeafGlbopt)
         {
             std::error_code copyErr;
             std::filesystem::copy_file(
@@ -771,10 +778,10 @@ namespace
 
         if (opt.debugAppearance)
         {
-            if (opt.disableGlbopt)
+            if (bypassLeafGlbopt)
             {
                 std::cout << "[LeafGlbOpt] tile=" << baseName
-                          << " glbopt=bypass (no merge/weld stats)\n";
+                          << " glbopt=bypass (disableGlbopt)\n";
             }
             else
             {
@@ -838,34 +845,23 @@ namespace
 
     static bool BakeInternalProxyArtifact(
         const TileOctree::Node& node,
-        const core::SceneIR& sceneIr,
+        [[maybe_unused]] const core::SceneIR& sceneIr,
         const TilesetEmit::Options& opt,
         BakedNodeArtifact& artifact,
         int depthFromRoot,
         int maxDepth,
-        const core::Aabb& rootBounds)
+        const core::Aabb& rootBounds,
+        const BakeState& bakeState)
     {
-        std::vector<std::uint32_t> proxyItems;
-        proxyItems.reserve(node.items.size() * 2u + 16u);
-        CollectSubtreeItemsRecursive(node, proxyItems);
-        std::sort(proxyItems.begin(), proxyItems.end());
-        proxyItems.erase(std::unique(proxyItems.begin(), proxyItems.end()), proxyItems.end());
-        if (proxyItems.empty())
-        {
-            artifact.GlbPath.clear();
-            artifact.ContentUri.clear();
-            return true;
-        }
-
         const std::string baseName = opt.tileFilePrefix + std::to_string(artifact.nodeId);
         const std::filesystem::path tilesDir =
             std::filesystem::path(opt.tilesetOutDir) / opt.contentSubdir;
 
         std::filesystem::create_directories(tilesDir);
 
-        const std::filesystem::path rawProxyGlbPath = tilesDir / (baseName + "_proxy_raw.glb");
-        const std::filesystem::path proxyGlbPath = tilesDir / (baseName + "_proxy.glb");
-        const std::filesystem::path proxyB3dmPath = tilesDir / (baseName + "_proxy.b3dm");
+        const std::filesystem::path rawProxyGlbPath = tilesDir / (baseName + "_raw.glb");
+        const std::filesystem::path proxyGlbPath = tilesDir / (baseName + ".glb");
+        const std::filesystem::path proxyB3dmPath = tilesDir / (baseName + ".b3dm");
 
         const NodeTuning tuning = BuildNodeTuning(
             artifact.bounds,
@@ -875,17 +871,10 @@ namespace
             false,
             opt.viewerTargetSse);
 
-        std::vector<std::string> instPaths;
-        CollectFilteredInstanceLodPaths(
-            proxyItems,
-            artifact.bounds,
-            opt.instanceMinSizeRatio,
-            sceneIr,
-            false,
-            opt.tilesetOutDir,
-            instPaths);
+        std::vector<std::string> leafGlbPaths;
+        CollectDescendantLeafOptimizedGlbPaths(node, bakeState, leafGlbPaths);
 
-        if (instPaths.empty())
+        if (leafGlbPaths.empty())
         {
             artifact.GlbPath.clear();
             artifact.ContentUri.clear();
@@ -894,16 +883,25 @@ namespace
 
         glbopt::Stats mergeStats;
         if (!glbopt::OptimizeGlbFiles(
-                instPaths,
+                leafGlbPaths,
                 rawProxyGlbPath.string(),
-                BuildMergeOnlyGlbOptOptions(),
+                BuildMergedInstanceGlbOptOptions(tuning, false),
                 mergeStats))
         {
             return false;
         }
 
+        const NodeTuning leafTuningForProxyAggression = BuildNodeTuning(
+            artifact.bounds,
+            rootBounds,
+            depthFromRoot,
+            maxDepth,
+            true,
+            opt.viewerTargetSse);
+        glbopt::Options proxyGlbOptions = BuildLeafGlbOptOptionsForNode(leafTuningForProxyAggression);
+        ScaleGlboptAggression(proxyGlbOptions, 2.0f);
+
         glbopt::Stats proxyStats;
-        const glbopt::Options glbOptions = BuildProxyGlbOptOptionsForNode(tuning);
         bool okProxyBake = true;
         if (opt.disableGlbopt)
         {
@@ -921,7 +919,7 @@ namespace
         else
         {
             okProxyBake =
-                glbopt::OptimizeGlbFile(rawProxyGlbPath.string(), proxyGlbPath.string(), glbOptions, proxyStats);
+                glbopt::OptimizeGlbFile(rawProxyGlbPath.string(), proxyGlbPath.string(), proxyGlbOptions, proxyStats);
         }
 
         if (opt.debugAppearance)
@@ -929,7 +927,7 @@ namespace
             if (opt.disableGlbopt)
             {
                 std::cout << "[ProxyGlbOpt] tile=" << baseName
-                          << " glbopt=bypass (no merge/weld stats)\n";
+                          << " glbopt=bypass (disableGlbopt)\n";
             }
             else
             {
@@ -946,7 +944,7 @@ namespace
 
                 std::cout << "[ProxyGlbOpt] tile=" << baseName
                           << " size=" << diag
-                          << " posStep=" << glbOptions.PositionStep
+                          << " posStep=" << proxyGlbOptions.PositionStep
                           << " vertsIn=" << proxyStats.InputVertexCount
                           << " vertsOut=" << proxyStats.OutputVertexCount
                           << " mergedVerts=" << proxyStats.MergedVertexCount
@@ -966,16 +964,16 @@ namespace
         if (!opt.disableGlbopt)
         {
             const bool geometryOk =
-                ValidateTileGeometryStats(proxyStats, expectStats, baseName + "_proxy");
+                ValidateTileGeometryStats(proxyStats, expectStats, baseName);
             const bool reductionOk =
-                ValidateProxyReduction(proxyStats, expectStats, baseName + "_proxy");
+                ValidateProxyReduction(proxyStats, expectStats, baseName);
 
             if (!geometryOk || !reductionOk)
             {
                 return false;
             }
 
-            if (!ValidateAppearanceCardinality(proxyStats, expectStats, baseName + "_proxy"))
+            if (!ValidateAppearanceCardinality(proxyStats, expectStats, baseName))
             {
                 return false;
             }
@@ -994,12 +992,11 @@ namespace
         }
 
         artifact.GlbPath = proxyGlbPath;
-        artifact.ContentUri = JoinUri(opt.contentSubdir, baseName + "_proxy.b3dm");
+        artifact.ContentUri = JoinUri(opt.contentSubdir, baseName + ".b3dm");
 
         if (!opt.keepGlbFilesForDebug)
         {
             std::error_code ec;
-            std::filesystem::remove(proxyGlbPath, ec);
             std::filesystem::remove(rawProxyGlbPath, ec);
         }
 
@@ -1087,7 +1084,8 @@ namespace
                     artifact,
                     depthFromRoot,
                     maxDepth,
-                    rootBounds);
+                    rootBounds,
+                    bakeState);
             }
         }
 

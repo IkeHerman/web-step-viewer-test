@@ -118,7 +118,8 @@ namespace glbopt
         bool ExtractPrimitive(
             const tinygltf::Model& model,
             const tinygltf::Primitive& primitive,
-            PrimitiveData& outData);
+            PrimitiveData& outData,
+            Stats* ioStats = nullptr);
 
         PrimitiveMergeKey MakeMergeKey(const PrimitiveData& primitive);
         bool CanSafelyMerge(const PrimitiveData& a, const PrimitiveData& b);

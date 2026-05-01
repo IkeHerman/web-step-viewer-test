@@ -179,16 +179,23 @@ std::array<core::Aabb, 8> TileOctree::MakeChildVolumes(const core::Aabb& parent,
 int TileOctree::FindContainingChild(const std::array<core::Aabb, 8>& children, const core::Aabb& itemBounds)
 {
     if (!itemBounds.valid)
+    {
         return -1;
+    }
 
     double ix0, iy0, iz0, ix1, iy1, iz1;
     GetMinMax(itemBounds, ix0, iy0, iz0, ix1, iy1, iz1);
+
+    int uniqueIndex = -1;
+    int matchCount = 0;
 
     for (int i = 0; i < 8; ++i)
     {
         const core::Aabb& c = children[static_cast<std::size_t>(i)];
         if (!c.valid)
+        {
             continue;
+        }
 
         double cx0, cy0, cz0, cx1, cy1, cz1;
         GetMinMax(c, cx0, cy0, cz0, cx1, cy1, cz1);
@@ -198,7 +205,15 @@ int TileOctree::FindContainingChild(const std::array<core::Aabb, 8>& children, c
             ix1 <= cx1 && iy1 <= cy1 && iz1 <= cz1;
 
         if (contains)
-            return i;
+        {
+            ++matchCount;
+            uniqueIndex = i;
+        }
+    }
+
+    if (matchCount == 1)
+    {
+        return uniqueIndex;
     }
 
     return -1;
@@ -264,9 +279,6 @@ void TileOctree::BuildNode(Node& node,
     std::array<std::uint64_t, 8> bucketTriangles{};
     bucketTriangles.fill(0);
 
-    int containedCount = 0;
-    int forcedCount = 0;
-
     for (std::uint32_t idx : inputItems)
     {
         const tiler::TileItem* item = FindTileItemById(items, idx);
@@ -277,14 +289,9 @@ void TileOctree::BuildNode(Node& node,
         const core::Aabb& itemBox = item->worldBounds;
 
         int childIndex = FindContainingChild(childVolumes, itemBox);
-        if (childIndex >= 0)
-        {
-            ++containedCount;
-        }
-        else
+        if (childIndex < 0)
         {
             childIndex = ChooseChildByItemCenter(node.volume, itemBox);
-            ++forcedCount;
         }
 
         buckets[static_cast<std::size_t>(childIndex)].push_back(idx);
@@ -292,20 +299,13 @@ void TileOctree::BuildNode(Node& node,
     }
 
     bool anyChildHasItems = false;
-    int nonEmptyChildCount = 0;
-    std::size_t largestBucketSize = 0;
-    std::uint64_t largestBucketTriangles = 0;
-
     for (int i = 0; i < 8; ++i)
     {
-        const std::size_t bucketSize = buckets[static_cast<std::size_t>(i)].size();
-        if (bucketSize == 0)
-            continue;
-
-        anyChildHasItems = true;
-        ++nonEmptyChildCount;
-        largestBucketSize = std::max(largestBucketSize, bucketSize);
-        largestBucketTriangles = std::max(largestBucketTriangles, bucketTriangles[static_cast<std::size_t>(i)]);
+        if (!buckets[static_cast<std::size_t>(i)].empty())
+        {
+            anyChildHasItems = true;
+            break;
+        }
     }
 
     if (!anyChildHasItems)
@@ -315,36 +315,6 @@ void TileOctree::BuildNode(Node& node,
             std::cout << "No child buckets populated at depth " << node.depth
                       << " - forcing leaf.\n";
         }
-        node.items = inputItems;
-        for (std::unique_ptr<Node>& c : node.children)
-            c.reset();
-        return;
-    }
-
-    const bool oneBucketGotEverything = (largestBucketSize == inputItems.size());
-    const bool poorItemSplit = (largestBucketSize >= (inputItems.size() * 98) / 100);
-    const bool poorTriangleSplit =
-        (totalTriangles > 0) &&
-        (largestBucketTriangles >= (totalTriangles * 98) / 100);
-    const bool allForced = (forcedCount == static_cast<int>(inputItems.size()));
-
-    if (oneBucketGotEverything || poorItemSplit || poorTriangleSplit)
-    {
-        if (m_cfg.verbose)
-        {
-            std::cout << "Stopping at depth " << node.depth
-                      << " due to ineffective split"
-                      << " (items=" << inputItems.size()
-                      << ", triangles=" << totalTriangles
-                      << ", children=" << nonEmptyChildCount
-                      << ", contained=" << containedCount
-                      << ", forced=" << forcedCount
-                      << ", allForced=" << (allForced ? "true" : "false")
-                      << ", largestBucketItems=" << largestBucketSize
-                      << ", largestBucketTriangles=" << largestBucketTriangles
-                      << ")\n";
-        }
-
         node.items = inputItems;
         for (std::unique_ptr<Node>& c : node.children)
             c.reset();

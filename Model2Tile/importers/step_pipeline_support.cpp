@@ -63,7 +63,7 @@ bool ValidateSceneIrInstanceIds(const core::SceneIR& sceneIr, bool verbose, bool
     std::size_t missing = 0;
     for (const core::SceneInstance& instance : sceneIr.instances)
     {
-        if (instance.highLodGlbUri.empty() || instance.lowLodGlbUri.empty())
+        if (instance.highLodGlbUri.empty())
         {
             ++missing;
         }

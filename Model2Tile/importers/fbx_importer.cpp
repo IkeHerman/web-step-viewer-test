@@ -1,5 +1,7 @@
 #include "fbx_importer.h"
 
+#include "../fbx_pipeline.h"
+
 #include <cctype>
 #include <iostream>
 #include <string>
@@ -34,8 +36,8 @@ const char* FbxImporter::FormatName() const
 ImportContract FbxImporter::Contract() const
 {
     ImportContract contract;
-    contract.producesSceneIr = false;
-    contract.emitsInstanceLodUris = false;
+    contract.producesSceneIr = true;
+    contract.emitsInstanceLodUris = true;
     return contract;
 }
 
@@ -56,10 +58,5 @@ bool FbxImporter::Supports(const CliOptions& cli) const
 
 int FbxImporter::Run(const CliOptions& cli) const
 {
-    std::cerr
-        << "FBX import is routed but not yet implemented.\n"
-        << "Input: " << cli.inputPath << "\n"
-        << "Target contract: produce SceneIR (prototypes + instances) with instance LOD URIs.\n"
-        << "Use --input-format step for STEP input.\n";
-    return 2;
+    return RunFbxPipeline(cli);
 }

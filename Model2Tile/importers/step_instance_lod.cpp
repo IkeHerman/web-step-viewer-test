@@ -33,8 +33,7 @@ bool BakeStepInstanceLods(
     const std::string& outputDirectory,
     const std::string& outputUriPrefix,
     const bool debugAppearance,
-    std::vector<std::string>& outHighGlbUris,
-    std::vector<std::string>& outLowGlbUris)
+    std::vector<std::string>& outHighGlbUris)
 {
     std::error_code ec;
     std::filesystem::create_directories(outputDirectory, ec);
@@ -47,7 +46,6 @@ bool BakeStepInstanceLods(
     const double rootDiag = std::max(1e-9, DiagonalLength(rootBounds));
 
     outHighGlbUris.assign(occurrences.size(), std::string());
-    outLowGlbUris.assign(occurrences.size(), std::string());
 
     for (std::size_t i = 0; i < occurrences.size(); ++i)
     {
@@ -62,30 +60,15 @@ bool BakeStepInstanceLods(
             ("occ_" + std::to_string(i));
 
         const std::string highFileName = "occ_" + std::to_string(i) + "_high.glb";
-        const std::string lowFileName = "occ_" + std::to_string(i) + "_low.glb";
         const std::string highPath = (base.string() + "_high.glb");
-        const std::string lowPath = (base.string() + "_low.glb");
 
         const double occDiag =
             occ.WorldBounds.IsVoid() ? rootDiag : std::max(1e-9, DiagonalLength(occ.WorldBounds));
 
         const ExportTessellationPolicy highPol =
             MakeInstanceHighTessellationPolicy(viewerTargetSse, occDiag);
-        const ExportTessellationPolicy lowPol =
-            MakeInstanceLowTessellationPolicy(viewerTargetSse, occDiag);
 
         const std::vector<std::uint32_t> oneIndex = { static_cast<std::uint32_t>(i) };
-
-        if (!ExportTileToGlbFile(
-                occurrences,
-                oneIndex,
-                lowPath,
-                debugAppearance,
-                lowPol))
-        {
-            std::cerr << "[StepInstanceLod] failed low export index=" << i << "\n";
-            return false;
-        }
 
         if (!ExportTileToGlbFile(
                 occurrences,
@@ -99,10 +82,9 @@ bool BakeStepInstanceLods(
         }
 
         outHighGlbUris[i] = outputUriPrefix + "/" + highFileName;
-        outLowGlbUris[i] = outputUriPrefix + "/" + lowFileName;
     }
 
-    std::cout << "[StepInstanceLod] baked high/low GLBs for "
+    std::cout << "[StepInstanceLod] baked high GLBs for "
               << occurrences.size() << " occurrences under " << outputDirectory << "\n";
 
     return true;
