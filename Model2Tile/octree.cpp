@@ -261,13 +261,10 @@ void TileOctree::BuildNode(Node& node,
         totalTriangles <= m_cfg.maxTrianglesPerNode ||
         MaxSideLength(node.volume) <= m_cfg.minNodeMaxSide)
     {
-        if (m_cfg.verbose)
-        {
-            std::cout << "Stopping at depth " << node.depth
-                      << " with " << inputItems.size()
-                      << " items and " << totalTriangles
-                      << " triangles.\n";
-        }
+        std::cout << "Stopping at depth " << node.depth
+                  << " with " << inputItems.size()
+                  << " items and " << totalTriangles
+                  << " triangles.\n";
         node.items = inputItems;
         return;
     }
@@ -310,11 +307,8 @@ void TileOctree::BuildNode(Node& node,
 
     if (!anyChildHasItems)
     {
-        if (m_cfg.verbose)
-        {
-            std::cout << "No child buckets populated at depth " << node.depth
-                      << " - forcing leaf.\n";
-        }
+        std::cout << "No child buckets populated at depth " << node.depth
+                  << " - forcing leaf.\n";
         node.items = inputItems;
         for (std::unique_ptr<Node>& c : node.children)
             c.reset();

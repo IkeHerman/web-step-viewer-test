@@ -36,6 +36,7 @@ struct ScenePrototype
     std::string materialKey;
     std::uint32_t triangleCount = 0;
     Aabb localBounds;
+    std::string highLodGlbUri;
 };
 
 struct SceneInstance
@@ -45,6 +46,11 @@ struct SceneInstance
     std::uint32_t prototypeId = 0;
     bool fromExplicitReference = false;
     Transform4d worldTransform;
+    /// STEP only (identity elsewhere): maps prototype GLB vertex coords (first baked occurrence for this
+    /// qualified key) into this occurrence's intrinsic local solid frame when instances share a key but
+    /// differ in intrinsic placement (translation by bbox-center delta). Tile composition uses
+    /// `worldTransform`, which includes this mapping as `WorldOcc * prototypeMeshToOccurrenceLocal`.
+    Transform4d prototypeMeshToOccurrenceLocal;
     Aabb worldBounds;
     std::string highLodGlbUri;
     std::string lowLodGlbUri;

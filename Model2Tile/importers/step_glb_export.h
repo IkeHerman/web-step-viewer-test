@@ -52,9 +52,8 @@ bool ExportTileToGlbFile(
     const std::vector<Occurrence>& occurrences,
     const std::vector<std::uint32_t>& itemIndices,
     const std::string& glbPath,
-    const bool debugAppearance,
-    const ExportTessellationPolicy& tessellationPolicy
-    );
+    const ExportTessellationPolicy& tessellationPolicy,
+    bool placeShapeInWorldSpace = true);
 
 bool ExportBoxToGlbFile(
     const Bnd_Box& bounds,

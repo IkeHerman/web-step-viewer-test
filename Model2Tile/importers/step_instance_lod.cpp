@@ -5,6 +5,8 @@
 #include <cmath>
 #include <filesystem>
 #include <iostream>
+#include <unordered_map>
+#include <vector>
 
 namespace
 {
@@ -32,8 +34,7 @@ bool BakeStepInstanceLods(
     const double viewerTargetSse,
     const std::string& outputDirectory,
     const std::string& outputUriPrefix,
-    const bool debugAppearance,
-    std::vector<std::string>& outHighGlbUris)
+    std::unordered_map<std::string, std::string>& outPrototypeHighLodUrisByQualifiedKey)
 {
     std::error_code ec;
     std::filesystem::create_directories(outputDirectory, ec);
@@ -45,47 +46,75 @@ bool BakeStepInstanceLods(
 
     const double rootDiag = std::max(1e-9, DiagonalLength(rootBounds));
 
-    outHighGlbUris.assign(occurrences.size(), std::string());
+    outPrototypeHighLodUrisByQualifiedKey.clear();
+
+    // Match Scene IR prototype order: first encounter of each QualifiedPrototypeKey in occurrence order.
+    std::vector<std::string> prototypeKeyOrder;
+    std::unordered_map<std::string, std::vector<std::uint32_t>> indicesByKey;
 
     for (std::size_t i = 0; i < occurrences.size(); ++i)
     {
         const Occurrence& occ = occurrences[i];
-        if (!occ.Appearance)
+        const std::string& k = occ.QualifiedPrototypeKey;
+        auto it = indicesByKey.find(k);
+        if (it == indicesByKey.end())
+        {
+            prototypeKeyOrder.push_back(k);
+            indicesByKey.emplace(k, std::vector<std::uint32_t>{});
+            it = indicesByKey.find(k);
+        }
+        if (occ.Appearance)
+        {
+            it->second.push_back(static_cast<std::uint32_t>(i));
+        }
+    }
+
+    std::size_t nextProtoFileIndex = 0;
+
+    for (const std::string& key : prototypeKeyOrder)
+    {
+        const std::vector<std::uint32_t>& idxs = indicesByKey[key];
+        if (idxs.empty())
         {
             continue;
         }
 
-        const std::filesystem::path base =
-            std::filesystem::path(outputDirectory) /
-            ("occ_" + std::to_string(i));
-
-        const std::string highFileName = "occ_" + std::to_string(i) + "_high.glb";
-        const std::string highPath = (base.string() + "_high.glb");
-
-        const double occDiag =
-            occ.WorldBounds.IsVoid() ? rootDiag : std::max(1e-9, DiagonalLength(occ.WorldBounds));
+        double maxDiag = rootDiag;
+        for (const std::uint32_t ix : idxs)
+        {
+            const Occurrence& o = occurrences[static_cast<std::size_t>(ix)];
+            const double d =
+                o.WorldBounds.IsVoid() ? rootDiag : std::max(1e-9, DiagonalLength(o.WorldBounds));
+            maxDiag = std::max(maxDiag, d);
+        }
 
         const ExportTessellationPolicy highPol =
-            MakeInstanceHighTessellationPolicy(viewerTargetSse, occDiag);
+            MakeInstanceHighTessellationPolicy(viewerTargetSse, maxDiag);
 
-        const std::vector<std::uint32_t> oneIndex = { static_cast<std::uint32_t>(i) };
+        const std::string stem = "proto_" + std::to_string(nextProtoFileIndex++);
+        const std::filesystem::path highPath =
+            std::filesystem::path(outputDirectory) / (stem + "_high.glb");
+
+        const std::vector<std::uint32_t> oneIndex = { idxs.front() };
 
         if (!ExportTileToGlbFile(
                 occurrences,
                 oneIndex,
-                highPath,
-                debugAppearance,
-                highPol))
+                highPath.string(),
+                highPol,
+                false))
         {
-            std::cerr << "[StepInstanceLod] failed high export index=" << i << "\n";
+            std::cerr << "[StepInstanceLod] failed high export prototypeKey=\"" << key << "\"\n";
             return false;
         }
 
-        outHighGlbUris[i] = outputUriPrefix + "/" + highFileName;
+        const std::string uri = outputUriPrefix + "/" + stem + "_high.glb";
+        outPrototypeHighLodUrisByQualifiedKey[key] = uri;
     }
 
     std::cout << "[StepInstanceLod] baked high GLBs for "
-              << occurrences.size() << " occurrences under " << outputDirectory << "\n";
+              << outPrototypeHighLodUrisByQualifiedKey.size() << " prototype keys ("
+              << nextProtoFileIndex << " files on disk) under " << outputDirectory << "\n";
 
     return true;
 }

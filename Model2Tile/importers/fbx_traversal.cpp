@@ -1,4 +1,5 @@
 #include "fbx_traversal.h"
+#include "fbx_instance_lod.h"
 
 #if __has_include(<assimp/Importer.hpp>)
 #include <assimp/Importer.hpp>
@@ -15,7 +16,6 @@
 #include <cmath>
 #include <cstdint>
 #include <filesystem>
-#include <fstream>
 #include <iostream>
 #include <sstream>
 #include <string>
@@ -113,29 +113,6 @@ std::string BuildMaterialKey(const aiMaterial* material, const unsigned int mate
     return ss.str();
 }
 
-std::vector<std::uint8_t> ReadFileBytes(const std::filesystem::path& filePath)
-{
-    std::ifstream in(filePath, std::ios::binary);
-    if (!in)
-    {
-        return {};
-    }
-    in.seekg(0, std::ios::end);
-    const std::streamsize size = in.tellg();
-    in.seekg(0, std::ios::beg);
-    if (size <= 0)
-    {
-        return {};
-    }
-    std::vector<std::uint8_t> out(static_cast<std::size_t>(size));
-    in.read(reinterpret_cast<char*>(out.data()), size);
-    if (!in)
-    {
-        return {};
-    }
-    return out;
-}
-
 std::string GuessMimeType(const std::string& texturePath)
 {
     const std::filesystem::path path(texturePath);
@@ -206,6 +183,7 @@ void ExtractTexturePayload(
         {
             const std::uint8_t* begin = reinterpret_cast<const std::uint8_t*>(embedded->pcData);
             outPayload.baseColorTextureBytes.assign(begin, begin + embedded->mWidth);
+            outPayload.baseColorTextureSourcePath.clear();
             const std::string hint = embedded->achFormatHint;
             if (!hint.empty())
             {
@@ -224,13 +202,8 @@ void ExtractTexturePayload(
     {
         return;
     }
-
-    std::vector<std::uint8_t> bytes = ReadFileBytes(resolvedPath);
-    if (bytes.empty())
-    {
-        return;
-    }
-    outPayload.baseColorTextureBytes = std::move(bytes);
+    outPayload.baseColorTextureSourcePath = resolvedPath.string();
+    outPayload.baseColorTextureBytes.clear();
     outPayload.baseColorTextureMimeType = GuessMimeType(resolvedPath.string());
 }
 
@@ -277,7 +250,16 @@ void CountMeshReferences(
     }
 }
 
-void TraverseNode(
+struct StreamBakeState
+{
+    std::string outputDirectory;
+    std::string outputUriPrefix;
+    std::unordered_map<std::string, std::string>* outPrototypeUris = nullptr;
+    std::size_t nextPrototypeId = 0;
+    bool verbose = false;
+};
+
+bool TraverseNode(
     const aiScene& scene,
     const std::filesystem::path& sourceFile,
     const aiNode* node,
@@ -285,7 +267,8 @@ void TraverseNode(
     const std::unordered_map<unsigned int, std::size_t>& meshUseCount,
     const std::string& parentPath,
     std::vector<importers::FbxOccurrence>& outOccurrences,
-    core::Aabb& outWorldBounds)
+    core::Aabb& outWorldBounds,
+    StreamBakeState* streamState)
 {
     const std::string nodeName = node->mName.C_Str();
     const std::string nodePath = parentPath.empty() ? nodeName : (parentPath + "/" + nodeName);
@@ -395,14 +378,47 @@ void TraverseNode(
 
         if (!occ.meshPayload.indices.empty())
         {
+            if (streamState != nullptr)
+            {
+                auto& uriMap = *streamState->outPrototypeUris;
+                const std::string& protoKey = occ.qualifiedPrototypeKey;
+                if (uriMap.find(protoKey) == uriMap.end())
+                {
+                    const std::string stem = "proto_" + std::to_string(streamState->nextPrototypeId++);
+                    const std::filesystem::path highPath =
+                        std::filesystem::path(streamState->outputDirectory) / (stem + "_high.glb");
+                    if (!importers::WriteFbxOccurrenceHighGlbLocalIdentity(
+                            occ, highPath.string(), streamState->verbose))
+                    {
+                        return false;
+                    }
+                    uriMap.emplace(protoKey, streamState->outputUriPrefix + "/" + stem + "_high.glb");
+                }
+
+                // Release heavy geometry/texture buffers once this occurrence is persisted.
+                occ.meshPayload = importers::FbxMeshPayload{};
+            }
             outOccurrences.push_back(std::move(occ));
         }
     }
 
     for (unsigned int i = 0; i < node->mNumChildren; ++i)
     {
-        TraverseNode(scene, sourceFile, node->mChildren[i], worldTransform, meshUseCount, nodePath, outOccurrences, outWorldBounds);
+        if (!TraverseNode(
+                scene,
+                sourceFile,
+                node->mChildren[i],
+                worldTransform,
+                meshUseCount,
+                nodePath,
+                outOccurrences,
+                outWorldBounds,
+                streamState))
+        {
+            return false;
+        }
     }
+    return true;
 }
 #endif
 } // namespace
@@ -423,6 +439,7 @@ bool CollectFbxOccurrences(
     std::cerr << "[FbxTraversal] assimp headers are unavailable. Install assimp and rebuild.\n";
     return false;
 #else
+    (void)verbose;
     Assimp::Importer importer;
     // TransformUVCoords: bake FBX tiling/rotation/offset (AI_MATKEY_UVTRANSFORM) into vertex TEXCOORD.
     // FlipUVs: map Assimp/OpenGL-ish V to upper-left-origin UV space used by WebGL/glTF sampling.
@@ -440,12 +457,95 @@ bool CollectFbxOccurrences(
     outWorldBounds = InvalidAabb();
     std::unordered_map<unsigned int, std::size_t> meshUseCount;
     CountMeshReferences(scene->mRootNode, meshUseCount);
-    TraverseNode(*scene, filePath, scene->mRootNode, aiMatrix4x4(), meshUseCount, "", outOccurrences, outWorldBounds);
-
-    if (verbose)
+    if (!TraverseNode(
+            *scene,
+            filePath,
+            scene->mRootNode,
+            aiMatrix4x4(),
+            meshUseCount,
+            "",
+            outOccurrences,
+            outWorldBounds,
+            nullptr))
     {
-        std::cout << "[FbxTraversal] occurrences=" << outOccurrences.size() << "\n";
+        return false;
     }
+
+    std::cout << "[FbxTraversal] occurrences=" << outOccurrences.size() << "\n";
+    return true;
+#endif
+}
+
+bool CollectFbxOccurrencesAndBakeLods(
+    const std::filesystem::path& filePath,
+    const std::string& outputDirectory,
+    const std::string& outputUriPrefix,
+    std::vector<FbxOccurrence>& outOccurrences,
+    std::unordered_map<std::string, std::string>& outPrototypeHighLodUrisByQualifiedKey,
+    core::Aabb& outWorldBounds,
+    const bool verbose)
+{
+#if !MODEL2TILE_HAS_ASSIMP
+    (void)filePath;
+    (void)outputDirectory;
+    (void)outputUriPrefix;
+    (void)outOccurrences;
+    (void)outPrototypeHighLodUrisByQualifiedKey;
+    (void)outWorldBounds;
+    (void)verbose;
+    std::cerr << "[FbxTraversal] assimp headers are unavailable. Install assimp and rebuild.\n";
+    return false;
+#else
+    (void)verbose;
+    Assimp::Importer importer;
+    const unsigned int flags = aiProcess_Triangulate | aiProcess_ImproveCacheLocality |
+        aiProcess_SortByPType | aiProcess_TransformUVCoords | aiProcess_FlipUVs;
+    const aiScene* scene = importer.ReadFile(filePath.string(), flags);
+    if (scene == nullptr || scene->mRootNode == nullptr)
+    {
+        std::cerr << "[FbxTraversal] failed to read: " << filePath << "\n";
+        std::cerr << "[FbxTraversal] assimp error: " << importer.GetErrorString() << "\n";
+        return false;
+    }
+
+    std::error_code createDirError;
+    std::filesystem::create_directories(outputDirectory, createDirError);
+    if (createDirError)
+    {
+        std::cerr << "[FbxTraversal] failed to create directory: " << outputDirectory << "\n";
+        return false;
+    }
+
+    outOccurrences.clear();
+    outPrototypeHighLodUrisByQualifiedKey.clear();
+    outWorldBounds = InvalidAabb();
+
+    std::unordered_map<unsigned int, std::size_t> meshUseCount;
+    CountMeshReferences(scene->mRootNode, meshUseCount);
+
+    StreamBakeState streamState;
+    streamState.outputDirectory = outputDirectory;
+    streamState.outputUriPrefix = outputUriPrefix;
+    streamState.outPrototypeUris = &outPrototypeHighLodUrisByQualifiedKey;
+    streamState.nextPrototypeId = 0;
+    streamState.verbose = true;
+
+    if (!TraverseNode(
+            *scene,
+            filePath,
+            scene->mRootNode,
+            aiMatrix4x4(),
+            meshUseCount,
+            "",
+            outOccurrences,
+            outWorldBounds,
+            &streamState))
+    {
+        return false;
+    }
+
+    std::cout << "[FbxTraversal] occurrences=" << outOccurrences.size()
+              << " prototypeHighGlbs=" << outPrototypeHighLodUrisByQualifiedKey.size() << "\n";
     return true;
 #endif
 }

@@ -1,7 +1,6 @@
 #include "fbx_pipeline.h"
 
 #include "adapters/fbx_to_scene_ir.h"
-#include "importers/fbx_instance_lod.h"
 #include "importers/fbx_traversal.h"
 #include "importers/step_pipeline_support.h"
 #include "octree.h"
@@ -10,13 +9,24 @@
 
 #include <filesystem>
 #include <iostream>
+#include <unordered_map>
 #include <vector>
 
 int RunFbxPipeline(const CliOptions& cli)
 {
     std::vector<importers::FbxOccurrence> occurrences;
+    std::unordered_map<std::string, std::string> prototypeHighLodUrisByKey;
     core::Aabb globalBounds;
-    if (!importers::CollectFbxOccurrences(cli.inputPath, occurrences, globalBounds, cli.verbose))
+    const std::string lodUriPrefix = "instance_lods";
+    const std::filesystem::path lodDir = std::filesystem::path(cli.outDir) / lodUriPrefix;
+    if (!importers::CollectFbxOccurrencesAndBakeLods(
+            cli.inputPath,
+            lodDir.string(),
+            lodUriPrefix,
+            occurrences,
+            prototypeHighLodUrisByKey,
+            globalBounds,
+            true))
     {
         return 1;
     }
@@ -26,25 +36,13 @@ int RunFbxPipeline(const CliOptions& cli)
         return 2;
     }
 
-    std::vector<std::string> instanceHighGlbUris;
-    const std::string lodUriPrefix = "instance_lods";
-    const std::filesystem::path lodDir = std::filesystem::path(cli.outDir) / lodUriPrefix;
-    if (!importers::BakeFbxInstanceLods(
-            occurrences,
-            lodDir.string(),
-            lodUriPrefix,
-            instanceHighGlbUris))
-    {
-        return 1;
-    }
-
     const core::SceneIR sceneIr = adapters::BuildSceneIRFromFbxOccurrences(
         cli.inputPath.string(),
         occurrences,
         globalBounds,
-        &instanceHighGlbUris,
+        &prototypeHighLodUrisByKey,
         nullptr);
-    if (!importers::ValidateSceneIrInstanceIds(sceneIr, cli.verbose, true))
+    if (!importers::ValidateSceneIrInstanceIds(sceneIr, true, true))
     {
         return 1;
     }
@@ -56,7 +54,6 @@ int RunFbxPipeline(const CliOptions& cli)
     cfg.maxTrianglesPerNode = 30000;
     cfg.minNodeMaxSide = 1e-6;
     cfg.looseFactor = 1.8;
-    cfg.verbose = cli.verbose;
 
     TileOctree tree(cfg);
     tree.Build(irTileItems, sceneIr.worldBounds);
@@ -66,7 +63,6 @@ int RunFbxPipeline(const CliOptions& cli)
     opt.contentSubdir = cli.contentSubdir;
     opt.tileFilePrefix = cli.tilePrefix;
     opt.keepGlbFilesForDebug = cli.keepGlb;
-    opt.debugAppearance = cli.verbose;
     opt.useTightBounds = cli.useTightBounds;
     opt.contentOnlyAtLeaves = cli.contentOnlyAtLeaves;
     opt.disableGlbopt = cli.disableGlbopt;

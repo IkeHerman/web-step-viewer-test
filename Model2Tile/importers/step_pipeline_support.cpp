@@ -69,12 +69,9 @@ bool ValidateSceneIrInstanceIds(const core::SceneIR& sceneIr, bool verbose, bool
         }
     }
 
-    if (verbose)
-    {
-        std::cout << "[SceneIR] instanceIdCheck unique=" << ids.size()
-                  << " instances=" << sceneIr.instances.size()
-                  << " missingLodUris=" << missing << "\n";
-    }
+    (void)verbose;
+    std::cout << "[SceneIR] instanceIdCheck unique=" << ids.size()
+              << " instances=" << sceneIr.instances.size() << " missingLodUris=" << missing << "\n";
     if (requireLodUris && missing > 0)
     {
         std::cerr << "[SceneIR] missing high/low LOD URI pairs for "

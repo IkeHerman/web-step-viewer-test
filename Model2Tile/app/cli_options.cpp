@@ -34,7 +34,7 @@ void PrintUsage(const char* programName)
         << "      --content-all-levels     Allow content at internal levels (default)\n"
         << "      --instance-min-size-ratio <x>\n"
         << "                               Min occurrenceDiag/tileDiag to include (default 1e-3; 0=no cull)\n"
-        << "  -v, --verbose                Enable verbose debug output\n"
+        << "  -v, --verbose                Open CASCADE STEP transfer checks (IFSelect::PrintCheckTransfer)\n"
         << "  -h, --help                   Show this help\n";
 }
 

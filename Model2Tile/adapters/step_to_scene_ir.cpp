@@ -1,5 +1,8 @@
 #include "step_to_scene_ir.h"
 
+#include "../core/transform_ops.h"
+
+#include <string>
 #include <unordered_map>
 
 namespace adapters
@@ -8,7 +11,7 @@ core::SceneIR BuildSceneIRFromStepOccurrences(
     const std::string& sourcePath,
     const std::vector<Occurrence>& occurrences,
     const core::Aabb& globalBounds,
-    const std::vector<std::string>* highLodGlbUris,
+    const std::unordered_map<std::string, std::string>* prototypeHighLodUrisByQualifiedKey,
     const std::vector<std::string>* lowLodGlbUris)
 {
     core::SceneIR out;
@@ -18,8 +21,27 @@ core::SceneIR BuildSceneIRFromStepOccurrences(
     out.instances.reserve(occurrences.size());
 
     std::unordered_map<std::string, std::uint32_t> prototypeByKey;
-    for (const Occurrence& occ : occurrences)
+
+    // First occurrence with appearance per qualified key matches the bake reference in `BakeStepInstanceLods`.
+    std::unordered_map<std::string, std::size_t> prototypeBakeRefOccIndex;
+    prototypeBakeRefOccIndex.reserve(occurrences.size());
+    for (std::size_t ri = 0; ri < occurrences.size(); ++ri)
     {
+        const Occurrence& ro = occurrences[ri];
+        if (!ro.Appearance)
+        {
+            continue;
+        }
+        const std::string& rq = ro.QualifiedPrototypeKey;
+        if (prototypeBakeRefOccIndex.find(rq) == prototypeBakeRefOccIndex.end())
+        {
+            prototypeBakeRefOccIndex[rq] = ri;
+        }
+    }
+
+    for (std::size_t occIndex = 0; occIndex < occurrences.size(); ++occIndex)
+    {
+        const Occurrence& occ = occurrences[occIndex];
         const std::string sourceLabel = occ.SourceLabelEntry;
         const std::string& geometryKey = occ.GeometryKey;
         const std::string& materialKey = occ.MaterialKey;
@@ -40,6 +62,14 @@ core::SceneIR BuildSceneIRFromStepOccurrences(
             prototype.materialKey = materialKey;
             prototype.triangleCount = occ.TriangleCount;
             prototype.localBounds = occ.LocalBoundsAabb;
+            if (prototypeHighLodUrisByQualifiedKey)
+            {
+                const auto glbIt = prototypeHighLodUrisByQualifiedKey->find(qualifiedKey);
+                if (glbIt != prototypeHighLodUrisByQualifiedKey->end())
+                {
+                    prototype.highLodGlbUri = glbIt->second;
+                }
+            }
             out.prototypes.push_back(std::move(prototype));
             prototypeByKey.emplace(qualifiedKey, prototypeId);
         }
@@ -53,13 +83,37 @@ core::SceneIR BuildSceneIRFromStepOccurrences(
         instance.sourceLabel = sourceLabel;
         instance.prototypeId = prototypeId;
         instance.fromExplicitReference = fromExplicitReference;
-        instance.worldTransform = occ.WorldTransformMatrix;
-        instance.worldBounds = occ.WorldBoundsAabb;
-        if (highLodGlbUris &&
-            instance.id < highLodGlbUris->size())
+
+        core::Transform4d prototypeMeshToOccurrenceLocal = core::Transform4d{};
+        core::Transform4d worldTransformOut = occ.WorldTransformMatrix;
+
+        std::size_t bakeRefRi = static_cast<std::size_t>(-1);
+        const auto refIt = prototypeBakeRefOccIndex.find(qualifiedKey);
+        if (refIt != prototypeBakeRefOccIndex.end())
         {
-            instance.highLodGlbUri =
-                (*highLodGlbUris)[instance.id];
+            bakeRefRi = refIt->second;
+        }
+
+        if (occ.Appearance && bakeRefRi != static_cast<std::size_t>(-1) &&
+            bakeRefRi != occIndex &&
+            occ.LocalBoundsAabb.valid &&
+            occurrences[bakeRefRi].LocalBoundsAabb.valid)
+        {
+            const core::Aabb& ra = occurrences[bakeRefRi].LocalBoundsAabb;
+            const core::Aabb& oa = occ.LocalBoundsAabb;
+            const double tcx = 0.5 * (oa.xmin + oa.xmax - ra.xmin - ra.xmax);
+            const double tcy = 0.5 * (oa.ymin + oa.ymax - ra.ymin - ra.ymax);
+            const double tcz = 0.5 * (oa.zmin + oa.zmax - ra.zmin - ra.zmax);
+            prototypeMeshToOccurrenceLocal = core::TranslationTransform(tcx, tcy, tcz);
+            worldTransformOut =
+                core::MultiplyTransforms(occ.WorldTransformMatrix, prototypeMeshToOccurrenceLocal);
+        }
+        instance.prototypeMeshToOccurrenceLocal = prototypeMeshToOccurrenceLocal;
+        instance.worldTransform = worldTransformOut;
+        instance.worldBounds = occ.WorldBoundsAabb;
+        if (prototypeId < out.prototypes.size())
+        {
+            instance.highLodGlbUri = out.prototypes[prototypeId].highLodGlbUri;
         }
         if (lowLodGlbUris &&
             instance.id < lowLodGlbUris->size())

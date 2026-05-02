@@ -10,12 +10,15 @@
 #include <string>
 #include <map>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <cstdint>
 #include <system_error>
 #include <cmath>
+#include <utility>
 
 #include "b3dm.h"
+#include "glb_compose_instancing.h"
 #include "glbopt.h"
 
 namespace
@@ -103,15 +106,14 @@ namespace
         return false;
     }
 
-    static void CollectFilteredInstanceLodPaths(
+    static void CollectFilteredLeafInstances(
         const std::vector<std::uint32_t>& itemIndices,
         const core::Aabb& tileBounds,
         double minSizeRatio,
         const core::SceneIR& sceneIr,
-        const std::string& tilesetOutDir,
-        std::vector<std::string>& outPaths)
+        std::vector<std::pair<std::uint32_t, core::Transform4d>>& outInstances)
     {
-        outPaths.clear();
+        outInstances.clear();
         if (!tileBounds.valid)
         {
             return;
@@ -127,8 +129,7 @@ namespace
                 continue;
             }
 
-            const std::string& p = matchedInstance->highLodGlbUri;
-            if (p.empty())
+            if (matchedInstance->highLodGlbUri.empty())
             {
                 continue;
             }
@@ -145,8 +146,7 @@ namespace
                 continue;
             }
 
-            std::filesystem::path absPath = std::filesystem::path(tilesetOutDir) / p;
-            outPaths.push_back(absPath.string());
+            outInstances.emplace_back(matchedInstance->prototypeId, matchedInstance->worldTransform);
         }
     }
 
@@ -234,7 +234,7 @@ namespace
         return true;
     }
 
-    static bool ValidateProxyReduction(
+    [[maybe_unused]] static bool ValidateProxyReduction(
         const glbopt::Stats& stats,
         bool expectNonEmpty,
         const std::string& label)
@@ -258,7 +258,7 @@ namespace
         return true;
     }
 
-    static bool ValidateAppearanceCardinality(
+    [[maybe_unused]] static bool ValidateAppearanceCardinality(
         const glbopt::Stats& stats,
         bool expectNonEmpty,
         const std::string& label)
@@ -559,7 +559,7 @@ namespace
         return tuning;
     }
 
-    /// Combine multiple instance GLBs into one buffer; weld + degenerate cleanup with node-scaled quantization.
+    /// Combine multiple instance GLBs into one buffer; weld, simplify, degenerate cleanup with node-scaled quantization.
     /// Merge uses bitwise TEXCOORD keys (`TexcoordStep` 0) so seams stay distinct unless UVs match exactly.
     static glbopt::Options BuildMergedInstanceGlbOptOptions(const NodeTuning& tuning, bool mergeFeedsLeafTile)
     {
@@ -584,7 +584,17 @@ namespace
         o.RemoveDegenerateByArea = true;
         o.DegenerateAreaEpsilonSq = 1e-20f;
 
-        o.Simplify = false;
+        o.Simplify = true;
+        if (mergeFeedsLeafTile)
+        {
+            o.SimplifyRatio = tuning.LeafSimplifyRatio;
+            o.SimplifyError = tuning.LeafSimplifyError;
+        }
+        else
+        {
+            o.SimplifyRatio = tuning.ProxySimplifyRatio;
+            o.SimplifyError = tuning.ProxySimplifyError;
+        }
         o.OptimizeVertexCache = true;
         o.OptimizeOverdraw = false;
         o.OptimizeVertexFetch = true;
@@ -611,8 +621,7 @@ namespace
         options.RemoveDegenerateByIndex = true;
         options.RemoveDegenerateByArea = true;
 
-        // Mesh simplification off: weld/merge/degenerate cleanup only (easier to isolate bad triangles).
-        options.Simplify = false;
+        options.Simplify = true;
         options.SimplifyRatio = tuning.LeafSimplifyRatio;
         options.SimplifyError = tuning.LeafSimplifyError;
 
@@ -662,7 +671,7 @@ namespace
         }
     }
 
-    static void ScaleGlboptAggression(glbopt::Options& o, float factor)
+    [[maybe_unused]] static void ScaleGlboptAggression(glbopt::Options& o, float factor)
     {
         if (!(factor > 1.0f))
         {
@@ -702,23 +711,36 @@ namespace
         const std::filesystem::path fullGlbPath = tilesDir / (baseName + ".glb");
         const std::filesystem::path fullB3dmPath = tilesDir / (baseName + ".b3dm");
 
-        std::vector<std::string> instPaths;
-        CollectFilteredInstanceLodPaths(
+        std::vector<std::pair<std::uint32_t, core::Transform4d>> leafInstances;
+        CollectFilteredLeafInstances(
             node.items,
             artifact.bounds,
             opt.instanceMinSizeRatio,
             sceneIr,
-            opt.tilesetOutDir,
-            instPaths);
+            leafInstances);
 
-        if (instPaths.empty())
+        if (leafInstances.empty())
         {
             artifact.GlbPath.clear();
             artifact.ContentUri.clear();
             return true;
         }
 
-        const NodeTuning tuning = BuildNodeTuning(
+        std::string composeErr;
+        glb_compose::InstancedLeafComposeStats composeStats;
+        if (!glb_compose::ComposeInstancedLeafGlb(
+                leafInstances,
+                sceneIr,
+                opt.tilesetOutDir,
+                rawFullGlbPath.string(),
+                composeErr,
+                &composeStats))
+        {
+            std::cerr << "[TilesetEmit] instanced leaf compose failed: " << composeErr << "\n";
+            return false;
+        }
+
+        const NodeTuning leafTuning = BuildNodeTuning(
             artifact.bounds,
             rootBounds,
             depthFromRoot,
@@ -726,22 +748,27 @@ namespace
             true,
             opt.viewerTargetSse);
 
-        const glbopt::Options leafGlbOptions = BuildLeafGlbOptOptionsForNode(tuning);
-        glbopt::Stats mergeStats;
-        if (!glbopt::OptimizeGlbFiles(
-                instPaths,
-                rawFullGlbPath.string(),
-                BuildMergedInstanceGlbOptOptions(tuning, true),
-                mergeStats))
+        bool mergedSingleMesh = false;
+        glbopt::Stats leafOptStats;
+        if (!opt.disableGlbopt)
         {
-            return false;
+            const glbopt::Options leafGlbOpt = BuildLeafGlbOptOptionsForNode(leafTuning);
+            if (!glbopt::OptimizeGlbFile(
+                    rawFullGlbPath.string(),
+                    fullGlbPath.string(),
+                    leafGlbOpt,
+                    leafOptStats))
+            {
+                std::cerr << "[TilesetEmit] leaf glbopt merge failed tile=" << baseName << "\n";
+                return false;
+            }
+            if (!ValidateTileGeometryStats(leafOptStats, true, baseName))
+            {
+                return false;
+            }
+            mergedSingleMesh = true;
         }
-
-        glbopt::Stats leafGlbStats;
-        const bool expectStats = node.totalTriangles > 0;
-        const bool bypassLeafGlbopt = opt.disableGlbopt;
-        bool okOptimize = true;
-        if (bypassLeafGlbopt)
+        else
         {
             std::error_code copyErr;
             std::filesystem::copy_file(
@@ -754,60 +781,16 @@ namespace
                 return false;
             }
         }
-        else
-        {
-            okOptimize =
-                glbopt::OptimizeGlbFile(
-                    rawFullGlbPath.string(),
-                    fullGlbPath.string(),
-                    leafGlbOptions,
-                    leafGlbStats);
-            if (!okOptimize)
-            {
-                return false;
-            }
-            if (!ValidateTileGeometryStats(leafGlbStats, expectStats, baseName))
-            {
-                return false;
-            }
-            if (!ValidateAppearanceCardinality(leafGlbStats, expectStats, baseName))
-            {
-                return false;
-            }
-        }
 
-        if (opt.debugAppearance)
-        {
-            if (bypassLeafGlbopt)
-            {
-                std::cout << "[LeafGlbOpt] tile=" << baseName
-                          << " glbopt=bypass (disableGlbopt)\n";
-            }
-            else
-            {
-                const double diag = DiagonalLength(artifact.bounds);
-                const std::size_t trisIn = leafGlbStats.InputPrimitiveElementCount / 3u;
-                const std::size_t trisOut = leafGlbStats.OutputPrimitiveElementCount / 3u;
-                double reductionPct = 0.0;
-                if (trisIn > 0u)
-                {
-                    reductionPct = 100.0 *
-                        (1.0 - (static_cast<double>(trisOut) / static_cast<double>(trisIn)));
-                }
-                reductionPct = ClampDouble(reductionPct, 0.0, 100.0);
-
-                std::cout << "[LeafGlbOpt] tile=" << baseName
-                          << " size=" << diag
-                          << " posStep=" << leafGlbOptions.PositionStep
-                          << " vertsIn=" << leafGlbStats.InputVertexCount
-                          << " vertsOut=" << leafGlbStats.OutputVertexCount
-                          << " mergedVerts=" << leafGlbStats.MergedVertexCount
-                          << " trisIn=" << trisIn
-                          << " trisOut=" << trisOut
-                          << " triDelta%=" << reductionPct
-                          << "\n";
-            }
-        }
+        std::cout << "[TileExport] tile=" << baseName << " instances=" << composeStats.instances
+                  << " prototypes=" << composeStats.uniquePrototypes
+                  << " materials=" << composeStats.materials
+                  << " mergedMesh=" << (mergedSingleMesh ? "yes" : "no")
+                  << (mergedSingleMesh
+                          ? (" primitivesOut=" + std::to_string(leafOptStats.PrimitiveCountMergedOut) +
+                             " vertsOut=" + std::to_string(leafOptStats.OutputVertexCount))
+                          : "")
+                  << "\n";
 
         std::string sourceLabelSample;
         if (!node.items.empty())
@@ -859,17 +842,8 @@ namespace
 
         std::filesystem::create_directories(tilesDir);
 
-        const std::filesystem::path rawProxyGlbPath = tilesDir / (baseName + "_raw.glb");
         const std::filesystem::path proxyGlbPath = tilesDir / (baseName + ".glb");
         const std::filesystem::path proxyB3dmPath = tilesDir / (baseName + ".b3dm");
-
-        const NodeTuning tuning = BuildNodeTuning(
-            artifact.bounds,
-            rootBounds,
-            depthFromRoot,
-            maxDepth,
-            false,
-            opt.viewerTargetSse);
 
         std::vector<std::string> leafGlbPaths;
         CollectDescendantLeafOptimizedGlbPaths(node, bakeState, leafGlbPaths);
@@ -881,33 +855,34 @@ namespace
             return true;
         }
 
-        glbopt::Stats mergeStats;
-        if (!glbopt::OptimizeGlbFiles(
-                leafGlbPaths,
-                rawProxyGlbPath.string(),
-                BuildMergedInstanceGlbOptOptions(tuning, false),
-                mergeStats))
+        // Stable order, drop duplicates (same leaf reachable only once in a tree, but be defensive).
         {
-            return false;
+            std::vector<std::string> deduped;
+            deduped.reserve(leafGlbPaths.size());
+            std::unordered_set<std::string> seen;
+            for (const std::string& p : leafGlbPaths)
+            {
+                if (seen.insert(p).second)
+                {
+                    deduped.push_back(p);
+                }
+            }
+            leafGlbPaths = std::move(deduped);
         }
 
-        const NodeTuning leafTuningForProxyAggression = BuildNodeTuning(
+        const NodeTuning proxyTuning = BuildNodeTuning(
             artifact.bounds,
             rootBounds,
             depthFromRoot,
             maxDepth,
-            true,
+            false,
             opt.viewerTargetSse);
-        glbopt::Options proxyGlbOptions = BuildLeafGlbOptOptionsForNode(leafTuningForProxyAggression);
-        ScaleGlboptAggression(proxyGlbOptions, 2.0f);
 
-        glbopt::Stats proxyStats;
-        bool okProxyBake = true;
-        if (opt.disableGlbopt)
+        if (leafGlbPaths.size() == 1)
         {
             std::error_code copyErr;
             std::filesystem::copy_file(
-                rawProxyGlbPath,
+                leafGlbPaths.front(),
                 proxyGlbPath,
                 std::filesystem::copy_options::overwrite_existing,
                 copyErr);
@@ -915,68 +890,45 @@ namespace
             {
                 return false;
             }
+            std::cout << "[ProxyGlbOpt] tile=" << baseName << " mergedLeaves=1 (single descendant)\n";
         }
         else
         {
-            okProxyBake =
-                glbopt::OptimizeGlbFile(rawProxyGlbPath.string(), proxyGlbPath.string(), proxyGlbOptions, proxyStats);
-        }
-
-        if (opt.debugAppearance)
-        {
-            if (opt.disableGlbopt)
+            glbopt::Options proxyOpts;
+            if (!opt.disableGlbopt)
             {
-                std::cout << "[ProxyGlbOpt] tile=" << baseName
-                          << " glbopt=bypass (disableGlbopt)\n";
+                proxyOpts = BuildMergedInstanceGlbOptOptions(proxyTuning, false);
+                proxyOpts.ForceDoubleSidedMaterials = false;
             }
             else
             {
-                const double diag = DiagonalLength(artifact.bounds);
-                const std::size_t trisIn = proxyStats.InputPrimitiveElementCount / 3u;
-                const std::size_t trisOut = proxyStats.OutputPrimitiveElementCount / 3u;
-                double reductionPct = 0.0;
-                if (trisIn > 0u)
-                {
-                    reductionPct = 100.0 *
-                        (1.0 - (static_cast<double>(trisOut) / static_cast<double>(trisIn)));
-                }
-                reductionPct = ClampDouble(reductionPct, 0.0, 100.0);
-
-                std::cout << "[ProxyGlbOpt] tile=" << baseName
-                          << " size=" << diag
-                          << " posStep=" << proxyGlbOptions.PositionStep
-                          << " vertsIn=" << proxyStats.InputVertexCount
-                          << " vertsOut=" << proxyStats.OutputVertexCount
-                          << " mergedVerts=" << proxyStats.MergedVertexCount
-                          << " trisIn=" << trisIn
-                          << " trisOut=" << trisOut
-                          << " triDelta%=" << reductionPct
-                          << "\n";
+                proxyOpts.DeduplicateMaterials = true;
+                proxyOpts.WeldPositions = false;
+                proxyOpts.WeldNormals = false;
+                proxyOpts.WeldTexcoord0 = false;
+                proxyOpts.WeldColor0 = false;
+                proxyOpts.Simplify = false;
+                proxyOpts.RemoveDegenerateByIndex = true;
+                proxyOpts.RemoveDegenerateByArea = true;
+                proxyOpts.DegenerateAreaEpsilonSq = 1e-20f;
+                proxyOpts.OptimizeVertexCache = false;
+                proxyOpts.OptimizeVertexFetch = false;
+                proxyOpts.ForceDoubleSidedMaterials = false;
             }
-        }
 
-        const bool expectStats = node.totalTriangles > 0;
-        if (!okProxyBake)
-        {
-            return false;
-        }
-
-        if (!opt.disableGlbopt)
-        {
-            const bool geometryOk =
-                ValidateTileGeometryStats(proxyStats, expectStats, baseName);
-            const bool reductionOk =
-                ValidateProxyReduction(proxyStats, expectStats, baseName);
-
-            if (!geometryOk || !reductionOk)
+            glbopt::Stats proxyStats;
+            if (!glbopt::OptimizeGlbFiles(leafGlbPaths, proxyGlbPath.string(), proxyOpts, proxyStats))
+            {
+                std::cerr << "[TilesetEmit] proxy merge failed tile=" << baseName << "\n";
+                return false;
+            }
+            if (!ValidateTileGeometryStats(proxyStats, true, baseName))
             {
                 return false;
             }
-
-            if (!ValidateAppearanceCardinality(proxyStats, expectStats, baseName))
-            {
-                return false;
-            }
+            std::cout << "[ProxyGlbOpt] tile=" << baseName << " mergedLeaves=" << leafGlbPaths.size()
+                      << " primitivesOut=" << proxyStats.PrimitiveCountMergedOut
+                      << " vertsOut=" << proxyStats.OutputVertexCount << "\n";
         }
 
         const std::map<std::string, std::string> tileMetadata = {
@@ -993,12 +945,6 @@ namespace
 
         artifact.GlbPath = proxyGlbPath;
         artifact.ContentUri = JoinUri(opt.contentSubdir, baseName + ".b3dm");
-
-        if (!opt.keepGlbFilesForDebug)
-        {
-            std::error_code ec;
-            std::filesystem::remove(rawProxyGlbPath, ec);
-        }
 
         return true;
     }

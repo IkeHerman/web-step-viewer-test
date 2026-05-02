@@ -54,7 +54,7 @@ endif
 
 CXXFLAGS += $(ASSIMP_CXXFLAGS)
 LDFLAGS += $(ASSIMP_LDFLAGS)
-LIBS ?= -lTKernel -lTKStd -lTKStdL -lTKXSBase -lTKLCAF -lTKDE -lTKDEGLTF -lTKRWMesh -lTKMesh -lTKBRep -lTKPrim -lTKCDF -lTKDCAF -lTKDESTEP -lTKGeomAlgo -lTKGeomBase -lTKMath -lTKService -lTKTopAlgo -lTKXCAF -lTKG2d -lTKG3d $(ASSIMP_LIBS)
+LIBS ?= -lTKernel -lTKStd -lTKStdL -lTKXSBase -lTKLCAF -lTKDE -lTKDEGLTF -lTKRWMesh -lTKMesh -lTKBRep -lTKPrim -lTKCDF -lTKDCAF -lTKDESTEP -lTKGeomAlgo -lTKGeomBase -lTKMath -lTKService -lTKTopAlgo -lTKXCAF -lTKG2d -lTKG3d -lTKShHealing $(ASSIMP_LIBS)
 RPATH := -Wl,-rpath,$(PREFIX)/lib $(ASSIMP_RPATH)
 
 # ---- Project sources ----
@@ -78,6 +78,7 @@ SOURCES := \
 	$(SRCDIR)/importers/step_glb_export.cpp \
 	$(SRCDIR)/b3dm.cpp \
 	$(SRCDIR)/tileset_emit.cpp \
+	$(SRCDIR)/glb_compose_instancing.cpp \
 	$(SRCDIR)/tinygltf_imp.cpp \
 	$(SRCDIR)/glbopt.cpp \
 	$(SRCDIR)/glbopt_deep_copy.cpp \

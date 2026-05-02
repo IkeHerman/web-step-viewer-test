@@ -24,7 +24,7 @@ struct NonRenderableLeafInfo
 
 bool CollectStepOccurrencesFromFiles(
     const std::vector<std::filesystem::path>& stepFiles,
-    bool verboseLogging,
+    bool occtVerbose,
     std::vector<Occurrence>& occurrences,
     Bnd_Box& globalBounds,
     std::size_t& traversedLeafLabels,

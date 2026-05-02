@@ -16,6 +16,7 @@ struct FbxMeshPayload
     std::vector<float> texcoords0;
     std::vector<std::uint32_t> indices;
     std::array<float, 4> baseColor = {0.7f, 0.7f, 0.7f, 1.0f};
+    std::string baseColorTextureSourcePath;
     std::vector<std::uint8_t> baseColorTextureBytes;
     std::string baseColorTextureMimeType;
 };

@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <iostream>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace
@@ -37,14 +38,17 @@ int main()
     occurrences.push_back(MakeOccurrence("inst_b", "geom_shared", "mat_shared", false, 10));
     occurrences.push_back(MakeOccurrence("inst_c", "geom_unique", "mat_other", true, 5));
 
-    std::vector<std::string> highUris = {"instance_lods/occ_0_high.glb", "instance_lods/occ_1_high.glb", "instance_lods/occ_2_high.glb"};
+    std::unordered_map<std::string, std::string> protoUris;
+    protoUris["geom_shared|mat:mat_shared"] = "instance_lods/proto_0_high.glb";
+    protoUris["geom_unique|mat:mat_other"] = "instance_lods/proto_1_high.glb";
+
     const core::Aabb worldBounds = {-1.0, -1.0, -1.0, 2.0, 2.0, 2.0, true};
 
     const core::SceneIR scene = adapters::BuildSceneIRFromFbxOccurrences(
         "probe.fbx",
         occurrences,
         worldBounds,
-        &highUris,
+        &protoUris,
         nullptr);
 
     if (scene.instances.size() != 3)
@@ -80,6 +84,11 @@ int main()
     if (scene.instances[0].highLodGlbUri.empty())
     {
         std::cerr << "Missing high LOD URI in SceneIR instances\n";
+        return 1;
+    }
+    if (scene.prototypes[0].highLodGlbUri != "instance_lods/proto_0_high.glb")
+    {
+        std::cerr << "Unexpected prototype 0 URI\n";
         return 1;
     }
 

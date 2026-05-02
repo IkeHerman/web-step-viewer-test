@@ -62,6 +62,11 @@ std::string JsonEscape(const std::string& input)
     return out;
 }
 
+std::string GlbFilenameForStepInstanceLog(const std::string& glbPath)
+{
+    return std::filesystem::path(glbPath).filename().string();
+}
+
 void AppendFidelityJsonLine(const std::string& fileName, const std::string& payload)
 {
     if (g_fidelityArtifactDirectory.empty())
@@ -350,8 +355,8 @@ bool ExportTileToGlbFile(
     const std::vector<Occurrence>& occurrences,
     const std::vector<std::uint32_t>& itemIndices,
     const std::string& glbPath,
-    const bool debugAppearance,
-    const ExportTessellationPolicy& tessellationPolicy)
+    const ExportTessellationPolicy& tessellationPolicy,
+    const bool placeShapeInWorldSpace)
 {
     Handle(TDocStd_Document) tileDoc = CreateEmptyXcafDocument();
     Handle(XCAFDoc_ShapeTool) tileShapeTool = GetShapeTool(tileDoc);
@@ -381,8 +386,9 @@ bool ExportTileToGlbFile(
         }
         const CachedOccurrenceAppearance& appearance = *occ.Appearance;
 
-        TopLoc_Location loc(occ.WorldTransform);
-        TopoDS_Shape placed = occ.Shape.Located(loc);
+        const TopoDS_Shape placed = placeShapeInWorldSpace
+            ? occ.Shape.Located(TopLoc_Location(occ.WorldTransform))
+            : occ.Shape;
 
         const TDF_Label exportedLabel = tileShapeTool->AddShape(placed, Standard_False);
         const TopoDS_Shape exportedShape = tileShapeTool->GetShape(exportedLabel);
@@ -457,7 +463,8 @@ bool ExportTileToGlbFile(
 
     if (addedCount == 0 || exportedLabels.empty())
     {
-        std::cerr << "[ExportTile] no shapes to export path=" << glbPath << "\n";
+        std::cerr << "[ExportStepPrototype] no shapes to export "
+                  << GlbFilenameForStepInstanceLog(glbPath) << "\n";
         return false;
     }
 
@@ -532,26 +539,6 @@ bool ExportTileToGlbFile(
         }
     }
 
-    if (debugAppearance)
-    {
-        std::cout << "[AppearanceProbe:Export] glb=" << glbPath
-                  << " occ=" << addedCount
-                  << " sourceTriangles=" << triCount
-                  << " glbTriangles=" << exportedTriangleCount
-                  << " shapeColorApplied=" << dbgShapeColorApplied
-                  << " shapeMaterialApplied=" << dbgShapeMaterialApplied
-                  << " occWithFaceLoop=" << dbgOccurrencesWithFaceLoop
-                  << " faceColorApplied=" << dbgFaceColorApplied
-                  << " faceMaterialApplied=" << dbgFaceMaterialApplied
-                  << " faceMappingMismatches=" << dbgFaceMappingMismatches
-                  << " exportedMaterials=" << exportedMaterialCount
-                  << " alphaBlendMaterials=" << exportedAlphaBlendCount
-                  << " alphaMaskMaterials=" << exportedAlphaMaskCount
-                  << " chosenSSE=" << resolved.chosenSse
-                  << " linearDeflection=" << resolved.linearDeflection
-                  << " angularDeflectionDeg=" << resolved.angularDeflectionDeg
-                  << "\n";
-    }
     AppendFidelityJsonLine(
         "export_evidence.jsonl",
         std::string("{\"glb\":\"") + JsonEscape(glbPath) +
@@ -574,16 +561,17 @@ bool ExportTileToGlbFile(
 
     if (ok)
     {
-        std::cout << "[ExportTile] wrote glb path=" << glbPath
-                  << " items=" << itemIndices.size()
-                  << " sourceTriangles=" << triCount
-                  << " glbTriangles=" << exportedTriangleCount
+        const std::size_t triangles =
+            exportedTriangleCount > 0 ? exportedTriangleCount : triCount;
+        std::cout << "[ExportStepPrototype] wrote glb "
+                  << GlbFilenameForStepInstanceLog(glbPath)
+                  << " Triangles=" << triangles
                   << " status=ok\n";
     }
     else
     {
-        std::cerr << "[ExportTile] failed glb path=" << glbPath
-                  << " items=" << itemIndices.size()
+        std::cerr << "[ExportStepPrototype] failed glb "
+                  << GlbFilenameForStepInstanceLog(glbPath)
                   << " status=error\n";
     }
 

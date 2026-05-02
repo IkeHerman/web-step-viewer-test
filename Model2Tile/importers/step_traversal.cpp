@@ -1,7 +1,9 @@
 #include "step_traversal.h"
 
 #include <STEPCAFControl_Reader.hxx>
+#include <IFSelect_PrintCount.hxx>
 #include <IFSelect_ReturnStatus.hxx>
+#include <STEPControl_Reader.hxx>
 
 #include <TCollection_AsciiString.hxx>
 #include <TDataStd_Name.hxx>
@@ -16,6 +18,7 @@
 #include <BRepBndLib.hxx>
 #include <BRep_Tool.hxx>
 #include <Poly_Triangulation.hxx>
+#include <ShapeUpgrade_RemoveLocations.hxx>
 #include <XCAFApp_Application.hxx>
 #include <XCAFDoc_ColorTool.hxx>
 #include <XCAFDoc_DocumentTool.hxx>
@@ -24,6 +27,7 @@
 #include <XCAFDoc_VisMaterialTool.hxx>
 
 #include <exception>
+#include <iomanip>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -164,24 +168,55 @@ std::string MaterialSignature(const CachedOccurrenceAppearance* appearance)
     return ss.str();
 }
 
-std::string GeometrySignatureForShape(const TopoDS_Shape& shape)
+/// Flattens nested `TopLoc_Location` into geometry for more stable bounds/topology when keying.
+/// Export paths still use the original shape; this is only for prototype deduplication signatures.
+TopoDS_Shape ShapeWithLocationsRemovedForKeying(const TopoDS_Shape& shape)
 {
-    const core::Aabb aabb = ToAabb(ComputeLocalBounds(shape));
+    if (shape.IsNull())
+    {
+        return shape;
+    }
+    ShapeUpgrade_RemoveLocations remover;
+    remover.SetRemoveLevel(TopAbs_SHAPE);
+    if (!remover.Remove(shape))
+    {
+        return shape;
+    }
+    const TopoDS_Shape out = remover.GetResult();
+    return out.IsNull() ? shape : out;
+}
+
+/// Coarse geometry signature for prototype keys and face seeds.
+/// Translation-invariant: uses axis-aligned **extents** (size) instead of absolute bbox corners.
+std::string CoarseGeometrySignatureForShape(const TopoDS_Shape& shape)
+{
+    const TopoDS_Shape sigShape = ShapeWithLocationsRemovedForKeying(shape);
+    const core::Aabb aabb = ToAabb(ComputeLocalBounds(sigShape));
     int edgeCount = 0;
     int vertexCount = 0;
     int faceCount = 0;
-    for (TopExp_Explorer ex(shape, TopAbs_FACE); ex.More(); ex.Next()) { ++faceCount; }
-    for (TopExp_Explorer ex(shape, TopAbs_EDGE); ex.More(); ex.Next()) { ++edgeCount; }
-    for (TopExp_Explorer ex(shape, TopAbs_VERTEX); ex.More(); ex.Next()) { ++vertexCount; }
+    for (TopExp_Explorer ex(sigShape, TopAbs_FACE); ex.More(); ex.Next()) { ++faceCount; }
+    for (TopExp_Explorer ex(sigShape, TopAbs_EDGE); ex.More(); ex.Next()) { ++edgeCount; }
+    for (TopExp_Explorer ex(sigShape, TopAbs_VERTEX); ex.More(); ex.Next()) { ++vertexCount; }
 
     std::ostringstream ss;
-    ss << "type:" << static_cast<int>(shape.ShapeType())
-       << "|ori:" << static_cast<int>(shape.Orientation())
+    ss << std::setprecision(17) << std::scientific;
+    ss << "type:" << static_cast<int>(sigShape.ShapeType())
+       << "|ori:" << static_cast<int>(sigShape.Orientation())
        << "|faces:" << faceCount
        << "|edges:" << edgeCount
-       << "|verts:" << vertexCount
-       << "|bbox:" << aabb.xmin << "," << aabb.ymin << "," << aabb.zmin << ","
-       << aabb.xmax << "," << aabb.ymax << "," << aabb.zmax;
+       << "|verts:" << vertexCount;
+    if (!aabb.valid)
+    {
+        ss << "|extents:void";
+    }
+    else
+    {
+        const double dx = aabb.xmax - aabb.xmin;
+        const double dy = aabb.ymax - aabb.ymin;
+        const double dz = aabb.zmax - aabb.zmin;
+        ss << "|extents:" << dx << "," << dy << "," << dz;
+    }
     return ss.str();
 }
 
@@ -464,7 +499,7 @@ std::size_t EmitSolidOccurrencesFromShape(
         occ.WorldTransformMatrix = ToTransform4d(emittedWorldTrsf);
         occ.LocalBoundsAabb = ToAabb(cached.LocalBounds);
         occ.WorldBoundsAabb = ToAabb(emittedWorldBounds);
-        occ.GeometryKey = GeometrySignatureForShape(emittedShapeAtLocalOrigin);
+        occ.GeometryKey = CoarseGeometrySignatureForShape(emittedShapeAtLocalOrigin);
         occ.MaterialKey = MaterialSignature(appearance.get());
         occ.QualifiedPrototypeKey = occ.GeometryKey + "|mat:" + occ.MaterialKey;
         occ.FromExplicitReference = (!sourceLabel.IsNull() && !effectiveLabel.IsNull() && sourceLabel != effectiveLabel);
@@ -479,7 +514,7 @@ std::size_t EmitSolidOccurrencesFromShape(
             }
 
             Occurrence::FacePrototypeSeed seed;
-            seed.GeometryKey = GeometrySignatureForShape(childShape);
+            seed.GeometryKey = CoarseGeometrySignatureForShape(childShape);
             seed.MaterialKey = FaceMaterialSignature(appearance.get(), faceIndex);
             seed.TriangleCount = CountExistingTrianglesOnly(childShape);
             seed.LocalBounds = ToAabb(ComputeLocalBounds(childShape));
@@ -509,8 +544,7 @@ void TraverseLabelToSolids(
     std::size_t& labelsWithShellFallback,
     std::size_t& nonAssemblyLabelsWithComponents,
     std::vector<importers::NonRenderableLeafInfo>& nonRenderableLeaves,
-    std::uint64_t& totalTriangles,
-    bool verboseLogging)
+    std::uint64_t& totalTriangles)
 {
     if (label.IsNull())
     {
@@ -536,7 +570,7 @@ void TraverseLabelToSolids(
                 shapeTool, colorTool, visMatTool, components.Value(i), worldLoc, solidCache,
                 occurrences, globalBounds, traversedLeafLabels, labelsWithNoRenderableGeometry,
                 labelsWithShellFallback, nonAssemblyLabelsWithComponents, nonRenderableLeaves,
-                totalTriangles, verboseLogging);
+                totalTriangles);
         }
         return;
     }
@@ -589,7 +623,7 @@ void TraverseLabelToSolids(
     }
 
     const std::size_t added = occurrences.size() - beforeCount;
-    if (added != emitted && verboseLogging)
+    if (added != emitted)
     {
         std::cerr << "Warning: emitted solid mismatch for label "
                   << LabelToString(effectiveLabel)
@@ -601,7 +635,8 @@ void TraverseLabelToSolids(
 
 bool LoadStepFileIntoDoc(
     const std::filesystem::path& stepPath,
-    const Handle(TDocStd_Document)& targetDoc)
+    const Handle(TDocStd_Document)& targetDoc,
+    const bool occtVerbose)
 {
     if (targetDoc.IsNull())
     {
@@ -633,6 +668,11 @@ bool LoadStepFileIntoDoc(
         return false;
     }
 
+    if (occtVerbose)
+    {
+        baseReader.PrintCheckTransfer(Standard_False, IFSelect_ItemsByEntity);
+    }
+
     return true;
 }
 }
@@ -641,7 +681,7 @@ namespace importers
 {
 bool CollectStepOccurrencesFromFiles(
     const std::vector<std::filesystem::path>& stepFiles,
-    const bool verboseLogging,
+    const bool occtVerbose,
     std::vector<Occurrence>& occurrences,
     Bnd_Box& globalBounds,
     std::size_t& traversedLeafLabels,
@@ -671,7 +711,7 @@ bool CollectStepOccurrencesFromFiles(
         std::cout << "Opening STEP: " << p << "\n";
         Handle(TDocStd_Document) doc;
         app->NewDocument("MDTV-XCAF", doc);
-        if (doc.IsNull() || !LoadStepFileIntoDoc(p, doc))
+        if (doc.IsNull() || !LoadStepFileIntoDoc(p, doc, occtVerbose))
         {
             std::cerr << "Load failed for: " << p << "\n";
             return false;
@@ -703,7 +743,7 @@ bool CollectStepOccurrencesFromFiles(
                 shapeTools[docIndex], colorTools[docIndex], visMatTools[docIndex], roots.Value(i),
                 identity, solidCache, occurrences, globalBounds, traversedLeafLabels,
                 labelsWithNoRenderableGeometry, labelsWithShellFallback, nonAssemblyLabelsWithComponents,
-                nonRenderableLeaves, totalTriangles, verboseLogging);
+                nonRenderableLeaves, totalTriangles);
         }
     }
 

@@ -15,7 +15,6 @@ namespace TilesetEmit
         std::string contentSubdir = "tiles";   // where .b3dm goes relative to tileset.json
         std::string tileFilePrefix = "tile_";  // tile_0.b3dm, tile_1.b3dm...
         bool keepGlbFilesForDebug = false;
-        bool debugAppearance = false;
         bool disableGlbopt = false;
         double viewerTargetSse = 80.0;
 

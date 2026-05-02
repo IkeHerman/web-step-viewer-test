@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <unordered_map>
+#include <string>
 
 namespace adapters
 {
@@ -9,7 +10,7 @@ core::SceneIR BuildSceneIRFromFbxOccurrences(
     const std::string& sourcePath,
     const std::vector<importers::FbxOccurrence>& occurrences,
     const core::Aabb& globalBounds,
-    const std::vector<std::string>* highLodGlbUris,
+    const std::unordered_map<std::string, std::string>* prototypeHighLodUrisByQualifiedKey,
     const std::vector<std::string>* lowLodGlbUris)
 {
     core::SceneIR out;
@@ -34,6 +35,14 @@ core::SceneIR BuildSceneIRFromFbxOccurrences(
             prototype.materialKey = occ.materialKey;
             prototype.triangleCount = occ.triangleCount;
             prototype.localBounds = occ.localBounds;
+            if (prototypeHighLodUrisByQualifiedKey)
+            {
+                const auto glbIt = prototypeHighLodUrisByQualifiedKey->find(occ.qualifiedPrototypeKey);
+                if (glbIt != prototypeHighLodUrisByQualifiedKey->end())
+                {
+                    prototype.highLodGlbUri = glbIt->second;
+                }
+            }
             out.prototypes.push_back(std::move(prototype));
             prototypeByKey.emplace(occ.qualifiedPrototypeKey, prototypeId);
         }
@@ -50,9 +59,9 @@ core::SceneIR BuildSceneIRFromFbxOccurrences(
         instance.fromExplicitReference = occ.fromExplicitReference;
         instance.worldTransform = occ.worldTransform;
         instance.worldBounds = occ.worldBounds;
-        if (highLodGlbUris && instance.id < highLodGlbUris->size())
+        if (prototypeId < out.prototypes.size())
         {
-            instance.highLodGlbUri = (*highLodGlbUris)[instance.id];
+            instance.highLodGlbUri = out.prototypes[prototypeId].highLodGlbUri;
         }
         if (lowLodGlbUris && instance.id < lowLodGlbUris->size())
         {

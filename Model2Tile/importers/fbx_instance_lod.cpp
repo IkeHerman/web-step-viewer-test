@@ -7,9 +7,11 @@
 #include <cstdint>
 #include <cstring>
 #include <algorithm>
+#include <fstream>
 #include <filesystem>
 #include <iostream>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace
@@ -85,6 +87,49 @@ bool IsFbxMatrixDebugEnabled()
     return env != nullptr && env[0] != '\0' && env[0] != '0';
 }
 
+std::vector<std::uint8_t> ReadBinaryFile(const std::string& filePath)
+{
+    std::ifstream in(filePath, std::ios::binary);
+    if (!in)
+    {
+        return {};
+    }
+    in.seekg(0, std::ios::end);
+    const std::streamsize size = in.tellg();
+    in.seekg(0, std::ios::beg);
+    if (size <= 0)
+    {
+        return {};
+    }
+    std::vector<std::uint8_t> out(static_cast<std::size_t>(size));
+    in.read(reinterpret_cast<char*>(out.data()), size);
+    if (!in)
+    {
+        return {};
+    }
+    return out;
+}
+
+const std::vector<std::uint8_t>* LoadExternalTextureBytesCached(const std::string& sourcePath)
+{
+    static std::unordered_map<std::string, std::vector<std::uint8_t>> s_textureBytesByPath;
+
+    const auto hit = s_textureBytesByPath.find(sourcePath);
+    if (hit != s_textureBytesByPath.end())
+    {
+        return &hit->second;
+    }
+
+    std::vector<std::uint8_t> bytes = ReadBinaryFile(sourcePath);
+    if (bytes.empty())
+    {
+        return nullptr;
+    }
+
+    auto inserted = s_textureBytesByPath.emplace(sourcePath, std::move(bytes));
+    return &inserted.first->second;
+}
+
 void EmitFbxMatrixDebug(const importers::FbxOccurrence& occ, const std::vector<double>& gltfMatrix)
 {
     static int s_printed = 0;
@@ -115,10 +160,28 @@ void EmitFbxMatrixDebug(const importers::FbxOccurrence& occ, const std::vector<d
               << "\n";
 }
 
-bool WriteOccurrenceGlb(const importers::FbxOccurrence& occ, const std::string& glbPath)
+bool WriteOccurrenceGlb(const importers::FbxOccurrence& occ, const std::string& glbPath, const bool localIdentityRoot)
 {
     const std::vector<std::uint32_t>& indices = occ.meshPayload.indices;
     const bool hasNormals = (occ.meshPayload.normals.size() == occ.meshPayload.positions.size());
+    const bool hasEmbeddedTextureBytes = !occ.meshPayload.baseColorTextureBytes.empty();
+    const bool hasExternalTextureRef = !occ.meshPayload.baseColorTextureSourcePath.empty();
+
+    const std::vector<std::uint8_t>* resolvedTextureBytes = nullptr;
+    if (hasEmbeddedTextureBytes)
+    {
+        resolvedTextureBytes = &occ.meshPayload.baseColorTextureBytes;
+    }
+    else if (hasExternalTextureRef)
+    {
+        resolvedTextureBytes = LoadExternalTextureBytesCached(occ.meshPayload.baseColorTextureSourcePath);
+        if (resolvedTextureBytes == nullptr)
+        {
+            std::cerr << "[FbxInstanceLod] failed to read external texture: "
+                      << occ.meshPayload.baseColorTextureSourcePath << "\n";
+            return false;
+        }
+    }
 
     tinygltf::Model model;
     tinygltf::Scene scene;
@@ -128,10 +191,17 @@ bool WriteOccurrenceGlb(const importers::FbxOccurrence& occ, const std::string& 
 
     tinygltf::Node node;
     node.mesh = 0;
-    WriteRowMajorToGltfColumnMajor(occ.worldTransform, node.matrix);
-    if (IsFbxMatrixDebugEnabled())
+    if (localIdentityRoot)
     {
-        EmitFbxMatrixDebug(occ, node.matrix);
+        node.matrix = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+    }
+    else
+    {
+        WriteRowMajorToGltfColumnMajor(occ.worldTransform, node.matrix);
+        if (IsFbxMatrixDebugEnabled())
+        {
+            EmitFbxMatrixDebug(occ, node.matrix);
+        }
     }
     model.nodes.push_back(node);
 
@@ -154,7 +224,7 @@ bool WriteOccurrenceGlb(const importers::FbxOccurrence& occ, const std::string& 
     mesh.primitives.push_back(primitive);
     model.meshes.push_back(mesh);
 
-    const bool hasTextureBytes = !occ.meshPayload.baseColorTextureBytes.empty();
+    const bool hasTextureBytes = (resolvedTextureBytes != nullptr && !resolvedTextureBytes->empty());
 
     tinygltf::Material material;
     material.pbrMetallicRoughness.baseColorFactor = {
@@ -197,7 +267,7 @@ bool WriteOccurrenceGlb(const importers::FbxOccurrence& occ, const std::string& 
     const std::size_t imageOffset = bufferData.size();
     if (hasTextureBytes)
     {
-        AppendBytes(bufferData, occ.meshPayload.baseColorTextureBytes);
+        AppendBytes(bufferData, *resolvedTextureBytes);
     }
     const std::size_t indexOffset = bufferData.size();
     AppendBytes(bufferData, indices);
@@ -243,7 +313,7 @@ bool WriteOccurrenceGlb(const importers::FbxOccurrence& occ, const std::string& 
         tinygltf::BufferView imgView;
         imgView.buffer = 0;
         imgView.byteOffset = static_cast<int>(imageOffset);
-        imgView.byteLength = static_cast<int>(occ.meshPayload.baseColorTextureBytes.size());
+        imgView.byteLength = static_cast<int>(resolvedTextureBytes->size());
         imgView.target = 0;
         imageBufferViewIndex = nextBufferViewIndex++;
         model.bufferViews.push_back(imgView);
@@ -325,6 +395,36 @@ bool WriteOccurrenceGlb(const importers::FbxOccurrence& occ, const std::string& 
 
 namespace importers
 {
+bool WriteFbxOccurrenceHighGlb(
+    const FbxOccurrence& occurrence,
+    const std::string& glbPath,
+    const bool verbose)
+{
+    const bool ok = WriteOccurrenceGlb(occurrence, glbPath, false);
+    (void)verbose;
+    if (ok)
+    {
+        std::cout << "[FbxInstanceWrite] source=\"" << occurrence.sourceLabel
+                  << "\" glb=\"" << glbPath << "\"\n";
+    }
+    return ok;
+}
+
+bool WriteFbxOccurrenceHighGlbLocalIdentity(
+    const FbxOccurrence& occurrence,
+    const std::string& glbPath,
+    const bool verbose)
+{
+    const bool ok = WriteOccurrenceGlb(occurrence, glbPath, true);
+    (void)verbose;
+    if (ok)
+    {
+        std::cout << "[FbxInstanceWrite] localIdentity source=\"" << occurrence.sourceLabel
+                  << "\" glb=\"" << glbPath << "\"\n";
+    }
+    return ok;
+}
+
 bool BakeFbxInstanceLods(
     const std::vector<FbxOccurrence>& occurrences,
     const std::string& outputDirectory,
@@ -346,7 +446,7 @@ bool BakeFbxInstanceLods(
         const std::string stem = "occ_" + std::to_string(i);
         const std::filesystem::path highPath = std::filesystem::path(outputDirectory) / (stem + "_high.glb");
 
-        if (!WriteOccurrenceGlb(occurrences[i], highPath.string()))
+        if (!WriteFbxOccurrenceHighGlb(occurrences[i], highPath.string(), false)) // world transform in file
         {
             return false;
         }
