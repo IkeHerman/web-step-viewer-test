@@ -13,7 +13,7 @@ class TileOctree
 public:
     struct Config
     {
-        int maxDepth = 10;
+        int maxDepth = 20;
         int maxItemsPerNode = 512;
         std::uint64_t maxTrianglesPerNode = 50000;
         double minNodeMaxSide = 1.0;

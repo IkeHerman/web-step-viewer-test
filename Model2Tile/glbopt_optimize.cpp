@@ -7,6 +7,7 @@
 #include <cstring>
 #include <limits>
 #include <unordered_map>
+#include <vector>
 
 namespace glbopt
 {
@@ -137,6 +138,18 @@ namespace glbopt
             const Vec3 ac = Sub(c.Position, a.Position);
             const Vec3 cross = Cross(ab, ac);
             return LengthSquared(cross) <= epsilonSq;
+        }
+
+        /// Squared length of `cross(ab, ac)`; monotonic with triangle area (same as degenerate test).
+        static double TriangleCrossLengthSquared(
+            const PackedVertex& a,
+            const PackedVertex& b,
+            const PackedVertex& c)
+        {
+            const Vec3 ab = Sub(b.Position, a.Position);
+            const Vec3 ac = Sub(c.Position, a.Position);
+            const Vec3 cross = Cross(ab, ac);
+            return static_cast<double>(LengthSquared(cross));
         }
 
         PrimitiveMergeKey MakeMergeKey(const PrimitiveData& primitive)
@@ -454,6 +467,88 @@ namespace glbopt
             ioData.Indices.swap(newIndices);
         }
 
+        /// Packs NORMAL / TEXCOORD_0 / COLOR_0 into a contiguous float buffer for meshopt_simplifyWithAttributes.
+        /// Returns floats per vertex (0 if none present — use position-only simplify).
+        static std::size_t BuildSimplifyAttributeBuffers(
+            const PrimitiveData& ioData,
+            const Options& options,
+            std::vector<float>& outAttrs,
+            std::vector<float>& outWeights)
+        {
+            std::size_t floatsPerVertex = 0;
+            if (ioData.HasNormals)
+            {
+                floatsPerVertex += 3;
+            }
+            if (ioData.HasTexcoord0)
+            {
+                floatsPerVertex += 2;
+            }
+            if (ioData.HasColor0)
+            {
+                floatsPerVertex += 4;
+            }
+            if (floatsPerVertex == 0)
+            {
+                outAttrs.clear();
+                outWeights.clear();
+                return 0;
+            }
+
+            const std::size_t n = ioData.Vertices.size();
+            outAttrs.resize(n * floatsPerVertex);
+            outWeights.resize(floatsPerVertex);
+
+            std::size_t wi = 0;
+            if (ioData.HasNormals)
+            {
+                outWeights[wi + 0] = options.SimplifyNormalWeight;
+                outWeights[wi + 1] = options.SimplifyNormalWeight;
+                outWeights[wi + 2] = options.SimplifyNormalWeight;
+                wi += 3;
+            }
+            if (ioData.HasTexcoord0)
+            {
+                outWeights[wi + 0] = options.SimplifyTexcoordWeight;
+                outWeights[wi + 1] = options.SimplifyTexcoordWeight;
+                wi += 2;
+            }
+            if (ioData.HasColor0)
+            {
+                outWeights[wi + 0] = options.SimplifyColorWeight;
+                outWeights[wi + 1] = options.SimplifyColorWeight;
+                outWeights[wi + 2] = options.SimplifyColorWeight;
+                outWeights[wi + 3] = options.SimplifyColorWeight;
+            }
+
+            for (std::size_t i = 0; i < n; ++i)
+            {
+                const PackedVertex& v = ioData.Vertices[i];
+                float* row = outAttrs.data() + i * floatsPerVertex;
+                std::size_t col = 0;
+                if (ioData.HasNormals)
+                {
+                    row[col++] = v.HasNormal ? v.Normal.X : 0.0f;
+                    row[col++] = v.HasNormal ? v.Normal.Y : 0.0f;
+                    row[col++] = v.HasNormal ? v.Normal.Z : 0.0f;
+                }
+                if (ioData.HasTexcoord0)
+                {
+                    row[col++] = v.HasTexcoord0 ? v.Texcoord0.X : 0.0f;
+                    row[col++] = v.HasTexcoord0 ? v.Texcoord0.Y : 0.0f;
+                }
+                if (ioData.HasColor0)
+                {
+                    row[col++] = v.HasColor0 ? v.Color0.X : 1.0f;
+                    row[col++] = v.HasColor0 ? v.Color0.Y : 1.0f;
+                    row[col++] = v.HasColor0 ? v.Color0.Z : 1.0f;
+                    row[col++] = v.HasColor0 ? v.Color0.W : 1.0f;
+                }
+            }
+
+            return floatsPerVertex;
+        }
+
         static void RunModeSafeOptimizer(
             PrimitiveData& ioData,
             const Options& options,
@@ -486,6 +581,8 @@ namespace glbopt
 
             if (options.Simplify && options.SimplifyRatio < 1.0f)
             {
+                const std::size_t trianglesBeforeSimplify = ioData.Indices.size() / 3;
+
                 const std::size_t currentPrimitiveCount = ioData.Indices.size() / 3;
                 const std::size_t targetPrimitiveCount = std::max<std::size_t>(
                     1,
@@ -494,21 +591,56 @@ namespace glbopt
 
                 const std::size_t targetIndexCount = targetPrimitiveCount * 3;
                 std::vector<std::uint32_t> simplified(ioData.Indices.size());
-                const std::size_t resultCount = meshopt_simplify(
-                    simplified.data(),
-                    ioData.Indices.data(),
-                    ioData.Indices.size(),
-                    &ioData.Vertices[0].Position.X,
-                    ioData.Vertices.size(),
-                    sizeof(PackedVertex),
-                    targetIndexCount,
-                    options.SimplifyError,
-                    0,
-                    nullptr);
+
+                std::vector<float> attrData;
+                std::vector<float> attrWeights;
+                const std::size_t attrFloatsPerVertex =
+                    BuildSimplifyAttributeBuffers(ioData, options, attrData, attrWeights);
+
+                std::size_t resultCount = 0;
+                if (attrFloatsPerVertex > 0)
+                {
+                    resultCount = meshopt_simplifyWithAttributes(
+                        simplified.data(),
+                        ioData.Indices.data(),
+                        ioData.Indices.size(),
+                        &ioData.Vertices[0].Position.X,
+                        ioData.Vertices.size(),
+                        sizeof(PackedVertex),
+                        attrData.data(),
+                        attrFloatsPerVertex * sizeof(float),
+                        attrWeights.data(),
+                        attrFloatsPerVertex,
+                        nullptr,
+                        targetIndexCount,
+                        options.SimplifyError,
+                        0,
+                        nullptr);
+                }
+                else
+                {
+                    resultCount = meshopt_simplify(
+                        simplified.data(),
+                        ioData.Indices.data(),
+                        ioData.Indices.size(),
+                        &ioData.Vertices[0].Position.X,
+                        ioData.Vertices.size(),
+                        sizeof(PackedVertex),
+                        targetIndexCount,
+                        options.SimplifyError,
+                        0,
+                        nullptr);
+                }
 
                 simplified.resize(resultCount);
                 ioData.Indices.swap(simplified);
-                stats.SimplifiedIndexCount += resultCount;
+
+                const std::size_t trianglesAfterSimplify = ioData.Indices.size() / 3;
+                if (trianglesBeforeSimplify > trianglesAfterSimplify)
+                {
+                    stats.TrianglesRemovedSimplify +=
+                        trianglesBeforeSimplify - trianglesAfterSimplify;
+                }
             }
 
             if (options.OptimizeVertexCache)
@@ -552,7 +684,138 @@ namespace glbopt
             }
         }
 
-        void OptimizePrimitiveData(
+        struct BudgetTriRecord
+        {
+            double Metric = 0.0;
+            PrimitiveMergeKey Key{};
+            std::uint32_t TriIndex = 0;
+        };
+
+        void ApplyGlobalMaxTriangles(
+            std::unordered_map<PrimitiveMergeKey, PrimitiveData, PrimitiveMergeKeyHasher>& groups,
+            const Options& options,
+            Stats& stats)
+        {
+            if (options.MaxTriangles == 0)
+            {
+                return;
+            }
+
+            std::size_t total = 0;
+            for (const auto& kv : groups)
+            {
+                const PrimitiveData& pd = kv.second;
+                if (!IsTriangleMode(pd.Mode) || pd.Indices.empty())
+                {
+                    continue;
+                }
+                total += pd.Indices.size() / 3;
+            }
+
+            if (total <= static_cast<std::size_t>(options.MaxTriangles))
+            {
+                return;
+            }
+
+            const std::size_t dropCount = total - static_cast<std::size_t>(options.MaxTriangles);
+
+            std::vector<BudgetTriRecord> records;
+            records.reserve(total);
+
+            for (const auto& kv : groups)
+            {
+                const PrimitiveMergeKey& key = kv.first;
+                const PrimitiveData& pd = kv.second;
+                if (!IsTriangleMode(pd.Mode) || pd.Indices.empty())
+                {
+                    continue;
+                }
+
+                const std::size_t triCount = pd.Indices.size() / 3;
+                for (std::size_t t = 0; t < triCount; ++t)
+                {
+                    const std::uint32_t ia = pd.Indices[t * 3 + 0];
+                    const std::uint32_t ib = pd.Indices[t * 3 + 1];
+                    const std::uint32_t ic = pd.Indices[t * 3 + 2];
+                    BudgetTriRecord rec;
+                    rec.Metric = TriangleCrossLengthSquared(
+                        pd.Vertices[ia],
+                        pd.Vertices[ib],
+                        pd.Vertices[ic]);
+                    rec.Key = key;
+                    rec.TriIndex = static_cast<std::uint32_t>(t);
+                    records.push_back(rec);
+                }
+            }
+
+            std::sort(
+                records.begin(),
+                records.end(),
+                [](const BudgetTriRecord& a, const BudgetTriRecord& b)
+                {
+                    if (a.Metric != b.Metric)
+                    {
+                        return a.Metric < b.Metric;
+                    }
+                    if (!(a.Key == b.Key))
+                    {
+                        return a.Key < b.Key;
+                    }
+                    return a.TriIndex < b.TriIndex;
+                });
+
+            std::unordered_map<PrimitiveMergeKey, std::vector<std::uint32_t>, PrimitiveMergeKeyHasher>
+                dropsByKey;
+            dropsByKey.reserve(dropCount);
+            for (std::size_t i = 0; i < dropCount; ++i)
+            {
+                const BudgetTriRecord& rec = records[i];
+                dropsByKey[rec.Key].push_back(rec.TriIndex);
+            }
+
+            for (auto& kv : groups)
+            {
+                PrimitiveData& pd = kv.second;
+                if (!IsTriangleMode(pd.Mode) || pd.Indices.empty())
+                {
+                    continue;
+                }
+
+                const auto itDrop = dropsByKey.find(kv.first);
+                if (itDrop == dropsByKey.end())
+                {
+                    continue;
+                }
+
+                const std::vector<std::uint32_t>& dropList = itDrop->second;
+                const std::size_t triCount = pd.Indices.size() / 3;
+                std::vector<std::uint8_t> dropTri(triCount, 0);
+                for (std::uint32_t t : dropList)
+                {
+                    if (static_cast<std::size_t>(t) < triCount)
+                    {
+                        dropTri[static_cast<std::size_t>(t)] = 1;
+                    }
+                }
+
+                std::vector<std::uint32_t> kept;
+                kept.reserve(pd.Indices.size() - dropList.size() * 3);
+                for (std::size_t t = 0; t < triCount; ++t)
+                {
+                    if (!dropTri[t])
+                    {
+                        kept.push_back(pd.Indices[t * 3 + 0]);
+                        kept.push_back(pd.Indices[t * 3 + 1]);
+                        kept.push_back(pd.Indices[t * 3 + 2]);
+                    }
+                }
+                pd.Indices.swap(kept);
+            }
+
+            stats.TrianglesRemovedMaxBudget += dropCount;
+        }
+
+        void PreparePrimitiveData(
             PrimitiveData& ioData,
             const Options& options,
             Stats& stats)
@@ -568,9 +831,41 @@ namespace glbopt
                 DropAllBlackVertexColor0(ioData);
             }
 
+            std::size_t trianglesBeforeWeld = 0;
+            if (IsTriangleMode(ioData.Mode) && !ioData.Indices.empty())
+            {
+                trianglesBeforeWeld = ioData.Indices.size() / 3;
+            }
+
             WeldVertices(ioData, options, stats);
             CullDegenerates(ioData, options, stats);
+
+            if (trianglesBeforeWeld > 0)
+            {
+                const std::size_t trianglesAfterWeldPhase = ioData.Indices.size() / 3;
+                if (trianglesBeforeWeld > trianglesAfterWeldPhase)
+                {
+                    stats.TrianglesRemovedWeldPhase +=
+                        trianglesBeforeWeld - trianglesAfterWeldPhase;
+                }
+            }
+        }
+
+        void FinalizePrimitiveData(
+            PrimitiveData& ioData,
+            const Options& options,
+            Stats& stats)
+        {
             RunModeSafeOptimizer(ioData, options, stats);
+        }
+
+        void OptimizePrimitiveData(
+            PrimitiveData& ioData,
+            const Options& options,
+            Stats& stats)
+        {
+            PreparePrimitiveData(ioData, options, stats);
+            FinalizePrimitiveData(ioData, options, stats);
         }
     }
 }

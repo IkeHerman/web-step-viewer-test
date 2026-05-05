@@ -53,6 +53,9 @@ ASSIMP_RPATH := -Wl,-rpath,$(abspath $(ASSIMP_LIB_DIR))
 endif
 
 CXXFLAGS += $(ASSIMP_CXXFLAGS)
+# Optional strict flags, e.g. `make EXTRA_CXXFLAGS="-Wunused-function -Wno-unused-parameter"`
+EXTRA_CXXFLAGS ?=
+CXXFLAGS += $(EXTRA_CXXFLAGS)
 LDFLAGS += $(ASSIMP_LDFLAGS)
 LIBS ?= -lTKernel -lTKStd -lTKStdL -lTKXSBase -lTKLCAF -lTKDE -lTKDEGLTF -lTKRWMesh -lTKMesh -lTKBRep -lTKPrim -lTKCDF -lTKDCAF -lTKDESTEP -lTKGeomAlgo -lTKGeomBase -lTKMath -lTKService -lTKTopAlgo -lTKXCAF -lTKG2d -lTKG3d -lTKShHealing $(ASSIMP_LIBS)
 RPATH := -Wl,-rpath,$(PREFIX)/lib $(ASSIMP_RPATH)
@@ -97,8 +100,12 @@ PROJECT_OBJECTS := $(patsubst $(SRCDIR)/%.cpp,$(BUILD_DIR)/%.o,$(SOURCES))
 OBJECTS := $(PROJECT_OBJECTS) $(MESHOPT_OBJECTS)
 DEPS := $(OBJECTS:.o=.d)
 
-.PHONY: all clean
+.PHONY: all clean analyze-unused
 all: $(TARGET)
+
+# Rebuild with extra static unused-function checks (project + meshoptimizer objects).
+analyze-unused: clean
+	$(MAKE) $(TARGET) EXTRA_CXXFLAGS="-Wunused-function -Wunused-const-variable -Wno-unused-parameter"
 
 $(BUILD_DIR):
 	mkdir -p $@

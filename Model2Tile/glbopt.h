@@ -1,13 +1,11 @@
 #pragma once
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
 namespace glbopt
 {
-    void SetVerboseLogging(bool enabled);
-    bool IsVerboseLogging();
-
     struct Options
     {
         bool DeduplicateMaterials = true;
@@ -37,10 +35,19 @@ namespace glbopt
         float SimplifyRatio = 1.0f;
         float SimplifyError = 1e-2f;
 
+        // Per-component weights for meshopt_simplifyWithAttributes (one float per attribute slot).
+        float SimplifyNormalWeight = 0.5f;
+        float SimplifyTexcoordWeight = 1.0f;
+        float SimplifyColorWeight = 0.25f;
+
         bool OptimizeVertexCache = true;
         bool OptimizeOverdraw = false;
         float OverdrawThreshold = 1.05f;
         bool OptimizeVertexFetch = true;
+
+        /// Hard cap on total triangles in the output GLB (all merged triangle primitives). Smallest-area
+        /// triangles are dropped first (after weld + degenerate cull). `0` disables the cap.
+        std::uint64_t MaxTriangles = 1000000;
     };
 
     struct Stats
@@ -67,36 +74,27 @@ namespace glbopt
         std::size_t DroppedPrimitivesInvalidAccessor = 0;
         std::size_t DroppedPrimitivesInvalidIndices = 0;
         std::size_t DroppedIndicesInvalidRemap = 0;
-        std::size_t SimplifiedIndexCount = 0;
+
+        /// Triangles removed after weld + degenerate cull (before simplify), summed over triangle primitives.
+        std::size_t TrianglesRemovedWeldPhase = 0;
+        /// Triangles removed by mesh simplification, summed over triangle primitives.
+        std::size_t TrianglesRemovedSimplify = 0;
+        /// Triangles removed to satisfy `MaxTriangles` (smallest-area-first), summed over triangle primitives.
+        std::size_t TrianglesRemovedMaxBudget = 0;
     };
 
+    /// Always fills `outStats` (reset at entry). Callers that do not need metrics may pass a temporary.
     bool OptimizeGlbFile(
         const std::string& inputPath,
         const std::string& outputPath,
         const Options& options,
-        Stats& outStats);
-
-    bool OptimizeGlbFile(
-        const std::string& inputPath,
-        const std::string& outputPath,
-        const Options& options);
-
-    bool OptimizeGlbFile(
-        const std::string& inputPath,
-        const std::string& outputPath);
+        Stats& outStats,
+        const std::string& passTag);
 
     bool OptimizeGlbFiles(
         const std::vector<std::string>& inputPaths,
         const std::string& outputPath,
         const Options& options,
-        Stats& outStats);
-
-    bool OptimizeGlbFiles(
-        const std::vector<std::string>& inputPaths,
-        const std::string& outputPath,
-        const Options& options);
-
-    bool OptimizeGlbFiles(
-        const std::vector<std::string>& inputPaths,
-        const std::string& outputPath);
+        Stats& outStats,
+        const std::string& passTag);
 }

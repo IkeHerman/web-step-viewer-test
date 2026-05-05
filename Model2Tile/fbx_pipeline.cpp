@@ -49,7 +49,7 @@ int RunFbxPipeline(const CliOptions& cli)
 
     const std::vector<tiler::TileItem> irTileItems = tiler::BuildTileItemsFromSceneIR(sceneIr);
     TileOctree::Config cfg;
-    cfg.maxDepth = 10;
+    cfg.maxDepth = 20;
     cfg.maxItemsPerNode = 96;
     cfg.maxTrianglesPerNode = 30000;
     cfg.minNodeMaxSide = 1e-6;
@@ -63,9 +63,6 @@ int RunFbxPipeline(const CliOptions& cli)
     opt.contentSubdir = cli.contentSubdir;
     opt.tileFilePrefix = cli.tilePrefix;
     opt.keepGlbFilesForDebug = cli.keepGlb;
-    opt.useTightBounds = cli.useTightBounds;
-    opt.contentOnlyAtLeaves = cli.contentOnlyAtLeaves;
-    opt.disableGlbopt = cli.disableGlbopt;
     opt.viewerTargetSse = cli.viewerTargetSse;
     opt.instanceMinSizeRatio = cli.instanceMinSizeRatio;
     opt.sceneIr = &sceneIr;
@@ -75,5 +72,6 @@ int RunFbxPipeline(const CliOptions& cli)
         std::cerr << "[FbxPipeline] tile export failed\n";
         return 1;
     }
+    std::cout << "[Stage] Tile export complete\n";
     return 0;
 }

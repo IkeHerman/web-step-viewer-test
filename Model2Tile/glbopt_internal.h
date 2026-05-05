@@ -78,6 +78,31 @@ namespace glbopt
             }
         };
 
+        inline bool operator<(const PrimitiveMergeKey& a, const PrimitiveMergeKey& b)
+        {
+            if (a.Material != b.Material)
+            {
+                return a.Material < b.Material;
+            }
+            if (a.Mode != b.Mode)
+            {
+                return a.Mode < b.Mode;
+            }
+            if (a.HasNormals != b.HasNormals)
+            {
+                return a.HasNormals < b.HasNormals;
+            }
+            if (a.HasTexcoord0 != b.HasTexcoord0)
+            {
+                return a.HasTexcoord0 < b.HasTexcoord0;
+            }
+            if (a.HasColor0 != b.HasColor0)
+            {
+                return a.HasColor0 < b.HasColor0;
+            }
+            return a.Bucket < b.Bucket;
+        }
+
         struct PrimitiveMergeKeyHasher
         {
             std::size_t operator()(const PrimitiveMergeKey& key) const noexcept;
@@ -113,7 +138,11 @@ namespace glbopt
 
         bool LoadGlb(const std::string& inputPath, tinygltf::Model& outModel);
         bool WriteGlb(tinygltf::Model& model, const std::string& outputPath);
-        void PrintStats(const Stats& stats, const std::string& label);
+        void PrintStats(
+            const Stats& stats,
+            const std::string& inputLabel,
+            const std::string& outputLabel,
+            const std::string& passTag);
 
         bool ExtractPrimitive(
             const tinygltf::Model& model,
@@ -125,8 +154,23 @@ namespace glbopt
         bool CanSafelyMerge(const PrimitiveData& a, const PrimitiveData& b);
         void AppendPrimitiveIntoMerged(const PrimitiveData& source, PrimitiveData& destination);
 
+        void PreparePrimitiveData(
+            PrimitiveData& ioData,
+            const Options& options,
+            Stats& stats);
+
+        void FinalizePrimitiveData(
+            PrimitiveData& ioData,
+            const Options& options,
+            Stats& stats);
+
         void OptimizePrimitiveData(
             PrimitiveData& ioData,
+            const Options& options,
+            Stats& stats);
+
+        void ApplyGlobalMaxTriangles(
+            std::unordered_map<PrimitiveMergeKey, PrimitiveData, PrimitiveMergeKeyHasher>& groups,
             const Options& options,
             Stats& stats);
 

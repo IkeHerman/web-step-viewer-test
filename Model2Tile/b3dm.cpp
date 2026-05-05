@@ -3,9 +3,9 @@
 
 #include <cstring>
 #include <fstream>
-#include <iostream>
+#include <limits>
 #include <map>
-
+#include <vector>
 
 namespace
 {
@@ -68,13 +68,12 @@ namespace
         json += "}";
         return json;
     }
-}
 
-namespace B3dm
-{
-    static std::vector<std::uint8_t> WrapGlbBytesWithMetadata(
-        const std::vector<std::uint8_t>& glbBytes,
-        const std::map<std::string, std::string>& metadata)
+    /// B3DM header + padded JSON sections only (GLB payload appended separately for streaming).
+    void BuildB3dmPrefixBytes(
+        std::uint32_t glbByteLength,
+        const std::map<std::string, std::string>& metadata,
+        std::vector<std::uint8_t>& outPrefix)
     {
         const std::string ftJsonStorage = metadata.empty() ? "{}" : "{\"BATCH_LENGTH\":1}";
         const char* ftJson = ftJsonStorage.c_str();
@@ -90,75 +89,98 @@ namespace B3dm
         const std::uint32_t ftBinLen = 0;
         const std::uint32_t btBinLen = 0;
 
-        const std::uint32_t byteLength =
+        const std::uint32_t totalByteLength =
             headerLen +
             ftJsonLenPadded + ftBinLen +
             btJsonLenPadded + btBinLen +
-            static_cast<std::uint32_t>(glbBytes.size());
+            glbByteLength;
 
-        std::vector<std::uint8_t> out;
-        out.reserve(byteLength);
+        outPrefix.clear();
+        outPrefix.reserve(static_cast<std::size_t>(totalByteLength - glbByteLength));
 
-        // Header
-        out.push_back('b'); out.push_back('3'); out.push_back('d'); out.push_back('m'); // magic
-        AppendU32LE(out, 1);            // version
-        AppendU32LE(out, byteLength);   // byteLength
-        AppendU32LE(out, ftJsonLenPadded); // featureTableJsonByteLength
-        AppendU32LE(out, ftBinLen);        // featureTableBinaryByteLength
-        AppendU32LE(out, btJsonLenPadded); // batchTableJsonByteLength
-        AppendU32LE(out, btBinLen);        // batchTableBinaryByteLength
+        outPrefix.push_back('b'); outPrefix.push_back('3'); outPrefix.push_back('d'); outPrefix.push_back('m');
+        AppendU32LE(outPrefix, 1);
+        AppendU32LE(outPrefix, totalByteLength);
+        AppendU32LE(outPrefix, ftJsonLenPadded);
+        AppendU32LE(outPrefix, ftBinLen);
+        AppendU32LE(outPrefix, btJsonLenPadded);
+        AppendU32LE(outPrefix, btBinLen);
 
-        // Feature table JSON + padding (spaces)
-        AppendBytes(out, ftJson, ftJsonLen);
-        out.insert(out.end(), ftJsonLenPadded - ftJsonLen, static_cast<std::uint8_t>(' '));
+        AppendBytes(outPrefix, ftJson, ftJsonLen);
+        outPrefix.insert(outPrefix.end(), ftJsonLenPadded - ftJsonLen, static_cast<std::uint8_t>(' '));
 
-        // Batch table JSON + padding (spaces)
-        AppendBytes(out, btJson, btJsonLen);
-        out.insert(out.end(), btJsonLenPadded - btJsonLen, static_cast<std::uint8_t>(' '));
-
-        // GLB bytes
-        AppendBytes(out, glbBytes.data(), glbBytes.size());
-
-        return out;
+        AppendBytes(outPrefix, btJson, btJsonLen);
+        outPrefix.insert(outPrefix.end(), btJsonLenPadded - btJsonLen, static_cast<std::uint8_t>(' '));
     }
 
-    std::vector<std::uint8_t> WrapGlbBytes(const std::vector<std::uint8_t>& glbBytes)
+    bool StreamGlbFileToB3dmFile(
+        const std::string& glbPath,
+        const std::string& b3dmPath,
+        const std::map<std::string, std::string>& metadata)
     {
-        return WrapGlbBytesWithMetadata(glbBytes, {});
-    }
-
-    std::vector<std::uint8_t> ReadFileBytes(const std::string& path)
-    {
-        std::ifstream f(path, std::ios::binary);
-        if (!f)
-            return {};
-
-        f.seekg(0, std::ios::end);
-        std::streamsize size = f.tellg();
-        f.seekg(0, std::ios::beg);
-
-        if (size <= 0)
-            return {};
-
-        std::vector<std::uint8_t> bytes(static_cast<std::size_t>(size));
-        f.read(reinterpret_cast<char*>(bytes.data()), size);
-        if (!f)
-            return {};
-
-        return bytes;
-    }
-
-    bool WriteBytesToFile(const std::string& path, const std::vector<std::uint8_t>& bytes)
-    {
-        std::ofstream f(path, std::ios::binary);
-        if (!f)
+        std::ifstream glbIn(glbPath, std::ios::binary);
+        if (!glbIn)
+        {
             return false;
+        }
 
-        f.write(reinterpret_cast<const char*>(bytes.data()),
-                static_cast<std::streamsize>(bytes.size()));
-        return static_cast<bool>(f);
+        glbIn.seekg(0, std::ios::end);
+        const std::streampos endPos = glbIn.tellg();
+        if (endPos <= std::streampos(0))
+        {
+            return false;
+        }
+        const std::uint64_t glbSize64 = static_cast<std::uint64_t>(endPos);
+        if (glbSize64 > static_cast<std::uint64_t>(std::numeric_limits<std::uint32_t>::max()))
+        {
+            return false;
+        }
+        const std::uint32_t glbSize = static_cast<std::uint32_t>(glbSize64);
+        glbIn.seekg(0, std::ios::beg);
+
+        std::vector<std::uint8_t> prefix;
+        BuildB3dmPrefixBytes(glbSize, metadata, prefix);
+
+        std::ofstream b3dmOut(b3dmPath, std::ios::binary);
+        if (!b3dmOut)
+        {
+            return false;
+        }
+
+        b3dmOut.write(reinterpret_cast<const char*>(prefix.data()),
+                      static_cast<std::streamsize>(prefix.size()));
+        if (!b3dmOut)
+        {
+            return false;
+        }
+
+        constexpr std::streamsize kChunk = static_cast<std::streamsize>(1024 * 1024);
+        std::vector<char> chunk(static_cast<std::size_t>(kChunk));
+        std::uint64_t copied = 0;
+        while (glbIn && copied < glbSize64)
+        {
+            glbIn.read(chunk.data(), kChunk);
+            const std::streamsize n = glbIn.gcount();
+            if (n > 0)
+            {
+                b3dmOut.write(chunk.data(), n);
+                if (!b3dmOut)
+                {
+                    return false;
+                }
+                copied += static_cast<std::uint64_t>(n);
+            }
+        }
+        if (copied != glbSize64 || !glbIn.eof() || glbIn.bad() || !b3dmOut.flush())
+        {
+            return false;
+        }
+        return true;
     }
+}
 
+namespace B3dm
+{
     bool WrapGlbFileToB3dmFile(const std::string& glbPath, const std::string& b3dmPath)
     {
         return WrapGlbFileToB3dmFile(glbPath, b3dmPath, {});
@@ -169,16 +191,6 @@ namespace B3dm
         const std::string& b3dmPath,
         const std::map<std::string, std::string>& metadata)
     {
-        //std::cout << "Reading GLB file: " << glbPath << "\n";
-
-        std::vector<std::uint8_t> glb = ReadFileBytes(glbPath);
-        if (glb.empty())
-            return false;
-
-        std::vector<std::uint8_t> b3dm = WrapGlbBytesWithMetadata(glb, metadata);
-
-        //std::cout << "Writing B3DM file: " << b3dmPath << "\n";
-
-        return WriteBytesToFile(b3dmPath, b3dm);
+        return StreamGlbFileToB3dmFile(glbPath, b3dmPath, metadata);
     }
 }

@@ -6,11 +6,10 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
-#include <sstream>
 #include <string>
 #include <map>
+#include <ostream>
 #include <unordered_map>
-#include <unordered_set>
 #include <vector>
 #include <cstdint>
 #include <system_error>
@@ -20,6 +19,7 @@
 #include "b3dm.h"
 #include "glb_compose_instancing.h"
 #include "glbopt.h"
+#include "tiler/node_scale_helpers.h"
 
 namespace
 {
@@ -105,6 +105,8 @@ namespace
         }
         return false;
     }
+
+    static void ScaleGlboptAggression(glbopt::Options& o, float factor);
 
     static void CollectFilteredLeafInstances(
         const std::vector<std::uint32_t>& itemIndices,
@@ -276,59 +278,6 @@ namespace
         return true;
     }
 
-    static void AccumulateTightBounds(
-        const TileOctree::Node& node,
-        const core::SceneIR& sceneIr,
-        core::Aabb& out)
-    {
-        for (std::uint32_t idx : node.items)
-        {
-            const core::SceneInstance* instance = FindInstanceById(sceneIr, idx);
-            if (!instance)
-            {
-                continue;
-            }
-
-            const core::Aabb& ob = instance->worldBounds;
-            if (!ob.valid)
-            {
-                continue;
-            }
-            if (!out.valid)
-            {
-                out = ob;
-            }
-            else
-            {
-                out.xmin = std::min(out.xmin, ob.xmin);
-                out.ymin = std::min(out.ymin, ob.ymin);
-                out.zmin = std::min(out.zmin, ob.zmin);
-                out.xmax = std::max(out.xmax, ob.xmax);
-                out.ymax = std::max(out.ymax, ob.ymax);
-                out.zmax = std::max(out.zmax, ob.zmax);
-            }
-        }
-
-        for (const auto& c : node.children)
-        {
-            if (!c)
-            {
-                continue;
-            }
-
-            AccumulateTightBounds(*c, sceneIr, out);
-        }
-    }
-
-    static core::Aabb ComputeTightBounds(const TileOctree::Node& node, const core::SceneIR& sceneIr)
-    {
-        core::Aabb b;
-        b.valid = false;
-        AccumulateTightBounds(node, sceneIr, b);
-
-        return b;
-    }
-
     static std::string JoinUri(const std::string& subdir, const std::string& name)
     {
         if (subdir.empty())
@@ -344,11 +293,11 @@ namespace
         return subdir + "/" + name;
     }
 
-    static void Indent(std::ostringstream& ss, int depth)
+    static void Indent(std::ostream& out, int depth)
     {
         for (int i = 0; i < depth; ++i)
         {
-            ss << "  ";
+            out << "  ";
         }
     }
 
@@ -394,29 +343,6 @@ namespace
         return a + (b - a) * u;
     }
 
-    static double ClampDouble(double v, double lo, double hi)
-    {
-        return std::max(lo, std::min(v, hi));
-    }
-
-    static double ComputeNodeBoxWeldStep(double nodeDiag, double rootDiag)
-    {
-        const double safeNodeDiag = std::max(0.0, nodeDiag);
-        const double rootStepMin = std::max(1e-12, rootDiag * 1e-9);
-
-        // Position weld step: fraction of the node AABB diagonal (scale-invariant).
-        // 10x coarser than the prior 2e-5 fraction for more aggressive vertex welding.
-        constexpr double kWeldFractionOfNodeDiag = 2e-4;
-
-        const double stepMin = std::max(rootStepMin, safeNodeDiag * 1e-9);
-        const double stepMax = std::max(stepMin, safeNodeDiag * 2e-3);
-
-        return ClampDouble(
-            safeNodeDiag * kWeldFractionOfNodeDiag,
-            stepMin,
-            stepMax);
-    }
-
     struct NodeTuning
     {
         float RelativeSize = 0.0f;
@@ -426,8 +352,7 @@ namespace
         float ProxyPositionStep = 1e-5f;
         float LeafPositionStep = 1e-5f;
 
-        // glbopt attribute quantization: scale with (node diagonal / root diagonal) like
-        // tessellation and geometricError, so small tiles use proportionally finer steps.
+        // glbopt attribute quantization from `BuildNodeTuning` (diagonal vs root); Leaf_* mirrors Proxy_*.
         float ProxyNormalStep = 1e-4f;
         float ProxyTexcoordStep = 1e-5f;
         float LeafNormalStep = 1e-4f;
@@ -445,7 +370,6 @@ namespace
     // SSE-inspired importance:
     // 1. Larger nodes relative to root stay less aggressive.
     // 2. Deeper nodes get somewhat more aggressive.
-    // 3. We use this only to choose bake-time proxy settings.
     static float ComputeNodeImportance(
         const core::Aabb& nodeBounds,
         const core::Aabb& rootBounds,
@@ -494,113 +418,93 @@ namespace
         const float aggressiveness =
             Clamp01((1.0f - tuning.RelativeSize) * 0.65f + tuning.NormalizedDepth * 0.35f);
 
-        const double weldStep = ComputeNodeBoxWeldStep(nodeDiag, rootDiag);
-        tuning.ProxyPositionStep = static_cast<float>(weldStep);
-        tuning.LeafPositionStep = static_cast<float>(weldStep);
+        const double weldStep = model2tile::ComputeNodeBoxWeldStep(nodeDiag, rootDiag);
+        const double relToRoot = model2tile::NodeToRootDiagonalRatio(nodeDiag, rootDiag);
 
-        const double relToRoot =
-            ClampDouble(nodeDiag / rootDiag, 1e-12, 1.0e6);
-        // 10x coarser than prior (1.5e-4 / 1.0e-4) for more aggressive normal quantization.
-        tuning.LeafNormalStep = static_cast<float>(
-            ClampDouble(1.5e-3 * relToRoot, 3e-5, 2e-2));
-        tuning.ProxyNormalStep = static_cast<float>(
-            ClampDouble(1.0e-3 * relToRoot, 3e-5, 1e-2));
-        tuning.LeafTexcoordStep = static_cast<float>(
-            ClampDouble(3.0e-6 * relToRoot, 1e-9, 5e-4));
-        tuning.ProxyTexcoordStep = static_cast<float>(
-            ClampDouble(5.0e-6 * relToRoot, 1e-9, 1e-3));
-
-        // Keep proxy reduction visible but less destructive than before.
-        tuning.ProxySimplifyRatio =
+        // Shared leaf/proxy glbopt tuning: same formulas; node diagonal differs by octree level.
+        const float positionStep = static_cast<float>(weldStep);
+        const float normalStep = static_cast<float>(
+            model2tile::ClampDouble(1.5e-3 * relToRoot, 3e-5, 2e-2));
+        const float texcoordStep = static_cast<float>(
+            model2tile::ClampDouble(5.0e-6 * relToRoot, 1e-9, 1e-3));
+        // Another ~2x triangle removal vs [0.71, 0.84]: double (1 - ratio) at each end.
+        const float simplifyRatio =
             LerpClamped(0.42f, 0.68f, 1.0f - aggressiveness);
 
-        // Mild leaf optimization with conservative retention.
-        const float leafAggressiveness =
-            Clamp01(tuning.NormalizedDepth * 0.5f + (1.0f - tuning.RelativeSize) * 0.5f);
-        tuning.LeafSimplifyRatio =
-            LerpClamped(0.99f, 0.95f, leafAggressiveness);
+        tuning.ProxyPositionStep = positionStep;
+        tuning.LeafPositionStep = positionStep;
+        tuning.ProxyNormalStep = normalStep;
+        tuning.LeafNormalStep = normalStep;
+        tuning.ProxyTexcoordStep = texcoordStep;
+        tuning.LeafTexcoordStep = texcoordStep;
+        tuning.ProxySimplifyRatio = simplifyRatio;
+        tuning.LeafSimplifyRatio = simplifyRatio;
 
-        // Geometric error model (octree-aligned):
-        // We scale geometric error from node diagonal, not with a fixed per-level
-        // multiplier. In an octree, linear size (and diagonal) tends to halve each
-        // level, so this naturally gives parent ~= 2x child error in regular regions.
-        // This avoids abrupt jumps from aggressive fixed ladders (e.g. 4x).
-        //
-        // SSE target scales this uniformly, preserving monotonic hierarchy behavior.
-        if (!isLeaf)
-        {
-            constexpr double kGeomErrFraction = 0.25;
-            constexpr double kGeomErrMinFraction = 0.08;
-            constexpr double kGeomErrMaxFraction = 0.35;
+        // Geometric error model (octree-aligned): same diagonal-based error for simplify tuning on
+        // all nodes. Tileset JSON still uses 0 for leaf tiles (`geometricError` on content leaves).
+        constexpr double kGeomErrFraction = 0.25;
+        constexpr double kGeomErrMinFraction = 0.08;
+        constexpr double kGeomErrMaxFraction = 0.35;
 
-            const double minErr = nodeDiag * kGeomErrMinFraction;
-            const double maxErr = nodeDiag * kGeomErrMaxFraction;
-            const double sseScale = ClampDouble(std::max(1.0, viewerTargetSse) / 80.0, 0.5, 2.0);
-            const double rawErr = nodeDiag * kGeomErrFraction * sseScale;
-            tuning.GeometricError = ClampDouble(rawErr, minErr, std::max(minErr, maxErr));
-        }
-        else
-        {
-            tuning.GeometricError = 0.0;
-        }
+        const double sseScale = model2tile::ClampViewerSseScaleTileDefault(viewerTargetSse);
+        const double geomErrForSimplify = model2tile::ClampDiagonalGeometricError(
+            nodeDiag,
+            sseScale,
+            kGeomErrFraction,
+            kGeomErrMinFraction,
+            kGeomErrMaxFraction);
 
-        const double errorFromGeom = std::max(1e-8, tuning.GeometricError / std::max(1e-9, rootDiag));
+        tuning.GeometricError = isLeaf ? 0.0 : geomErrForSimplify;
 
-        tuning.ProxySimplifyError = static_cast<float>(ClampDouble(
-            std::max(0.0015, errorFromGeom * 0.40) * (0.85 + 0.30 * static_cast<double>(tuning.NormalizedDepth)),
-            0.0015,
-            0.02));
+        const double errorFromGeom =
+            std::max(1e-8, geomErrForSimplify / std::max(1e-9, rootDiag));
 
-        tuning.LeafSimplifyError = static_cast<float>(ClampDouble(
-            std::max(0.00035, errorFromGeom * 0.1),
-            0.00035,
-            0.003));
+        // Meshoptimizer relative error cap (shared leaf/proxy). 2x more aggressive vs 2.5.
+        constexpr double kSimplifyErrorScale = 5.0;
+        const double simplifyErrorUnscaled =
+            std::max(0.0015, errorFromGeom * 0.40) *
+            (0.85 + 0.30 * static_cast<double>(tuning.NormalizedDepth));
+        const float simplifyError = static_cast<float>(model2tile::ClampDouble(
+            simplifyErrorUnscaled * kSimplifyErrorScale,
+            0.0015 * kSimplifyErrorScale,
+            0.02 * kSimplifyErrorScale));
+        tuning.ProxySimplifyError = simplifyError;
+        tuning.LeafSimplifyError = simplifyError;
 
         return tuning;
     }
 
-    /// Combine multiple instance GLBs into one buffer; weld, simplify, degenerate cleanup with node-scaled quantization.
-    /// Merge uses bitwise TEXCOORD keys (`TexcoordStep` 0) so seams stay distinct unless UVs match exactly.
-    static glbopt::Options BuildMergedInstanceGlbOptOptions(const NodeTuning& tuning, bool mergeFeedsLeafTile)
+    /// Weld quantization from `NodeTuning` (Proxy_* / Leaf_* steps are identical after `BuildNodeTuning`).
+    static void ApplyNodeTuningWeldQuantization(glbopt::Options& o, const NodeTuning& tuning)
+    {
+        o.PositionStep = tuning.ProxyPositionStep;
+        o.NormalStep = tuning.ProxyNormalStep;
+        o.TexcoordStep = 0.0f;
+        o.ColorStep = 1.0f / 255.0f;
+    }
+
+    /// Second-phase proxy merge: simplify off (inputs already simplified); weld + dedup + degenerates +
+    /// vertex layout on merged proxy. Weld steps come from `tuning` (same source as downscale/leaf).
+    static glbopt::Options BuildProxyCombineAfterLeafDownscaleOptions(const NodeTuning& tuning)
     {
         glbopt::Options o;
-
-        const float leafOrProxyNormalStep =
-            mergeFeedsLeafTile ? tuning.LeafNormalStep : tuning.ProxyNormalStep;
-
         o.DeduplicateMaterials = true;
         o.WeldPositions = true;
         o.WeldNormals = true;
         o.WeldTexcoord0 = true;
         o.WeldColor0 = true;
-
-        // Proxy vs leaf share the same positional weld quantization from BuildNodeTuning.
-        o.PositionStep = tuning.LeafPositionStep;
-        o.NormalStep = leafOrProxyNormalStep;
-        o.TexcoordStep = 0.0f;
-        o.ColorStep = 1.0f / 255.0f;
-
+        o.ForceDoubleSidedMaterials = false;
+        ApplyNodeTuningWeldQuantization(o, tuning);
+        o.Simplify = false;
         o.RemoveDegenerateByIndex = true;
         o.RemoveDegenerateByArea = true;
         o.DegenerateAreaEpsilonSq = 1e-20f;
-
-        o.Simplify = true;
-        if (mergeFeedsLeafTile)
-        {
-            o.SimplifyRatio = tuning.LeafSimplifyRatio;
-            o.SimplifyError = tuning.LeafSimplifyError;
-        }
-        else
-        {
-            o.SimplifyRatio = tuning.ProxySimplifyRatio;
-            o.SimplifyError = tuning.ProxySimplifyError;
-        }
         o.OptimizeVertexCache = true;
-        o.OptimizeOverdraw = false;
         o.OptimizeVertexFetch = true;
         return o;
     }
 
+    /// Leaf glbopt pass: weld, dedup, degenerate cleanup, simplify, vertex layout (see `BuildMergedInstanceGlbOptOptions`).
     static glbopt::Options BuildLeafGlbOptOptionsForNode(const NodeTuning& tuning)
     {
         glbopt::Options options;
@@ -612,11 +516,7 @@ namespace
         options.WeldColor0 = true;
         options.ForceDoubleSidedMaterials = false;
 
-        options.PositionStep = tuning.LeafPositionStep;
-        options.NormalStep = tuning.LeafNormalStep;
-        // Bitwise TEXCOORD weld keys — welding still runs; UVs participate as exact floats.
-        options.TexcoordStep = 0.0f;
-        options.ColorStep = 1.0f / 255.0f;
+        ApplyNodeTuningWeldQuantization(options, tuning);
 
         options.RemoveDegenerateByIndex = true;
         options.RemoveDegenerateByArea = true;
@@ -632,11 +532,21 @@ namespace
         return options;
     }
 
+    static glbopt::Options BuildLowForParentGlbOptOptions(const NodeTuning& parentTuning)
+    {
+        glbopt::Options options = BuildLeafGlbOptOptionsForNode(parentTuning);
+        // Low-for-parent should be more aggressive than the node's high tile pass.
+        ScaleGlboptAggression(options, 1.8f);
+        return options;
+    }
+
     struct BakedNodeArtifact
     {
         std::uint32_t nodeId = 0;
         bool isLeaf = false;
         core::Aabb bounds;
+        std::filesystem::path HighGlbPath;
+        std::filesystem::path LowForParentGlbPath;
         std::filesystem::path GlbPath;
         std::string ContentUri;
     };
@@ -647,31 +557,28 @@ namespace
         std::unordered_map<const TileOctree::Node*, BakedNodeArtifact> artifacts;
     };
 
-    static void CollectDescendantLeafOptimizedGlbPaths(
+    static void CollectImmediateChildLowGlbPaths(
         const TileOctree::Node& node,
         const BakeState& bakeState,
         std::vector<std::string>& outPaths)
     {
-        if (!HasAnyChild(node))
-        {
-            const auto it = bakeState.artifacts.find(&node);
-            if (it != bakeState.artifacts.end() && !it->second.GlbPath.empty())
-            {
-                outPaths.push_back(it->second.GlbPath.string());
-            }
-            return;
-        }
+        outPaths.clear();
         for (const auto& childPtr : node.children)
         {
             if (!childPtr)
             {
                 continue;
             }
-            CollectDescendantLeafOptimizedGlbPaths(*childPtr, bakeState, outPaths);
+            const auto it = bakeState.artifacts.find(childPtr.get());
+            if (it == bakeState.artifacts.end() || it->second.LowForParentGlbPath.empty())
+            {
+                continue;
+            }
+            outPaths.push_back(it->second.LowForParentGlbPath.string());
         }
     }
 
-    [[maybe_unused]] static void ScaleGlboptAggression(glbopt::Options& o, float factor)
+    static void ScaleGlboptAggression(glbopt::Options& o, float factor)
     {
         if (!(factor > 1.0f))
         {
@@ -697,6 +604,7 @@ namespace
         const core::SceneIR& sceneIr,
         const TilesetEmit::Options& opt,
         BakedNodeArtifact& artifact,
+        const core::Aabb* parentCellBounds,
         int depthFromRoot,
         int maxDepth,
         const core::Aabb& rootBounds)
@@ -709,6 +617,7 @@ namespace
 
         const std::filesystem::path rawFullGlbPath = tilesDir / (baseName + "_raw.glb");
         const std::filesystem::path fullGlbPath = tilesDir / (baseName + ".glb");
+        const std::filesystem::path lowGlbPath = tilesDir / (baseName + "__low.glb");
         const std::filesystem::path fullB3dmPath = tilesDir / (baseName + ".b3dm");
 
         std::vector<std::pair<std::uint32_t, core::Transform4d>> leafInstances;
@@ -748,49 +657,51 @@ namespace
             true,
             opt.viewerTargetSse);
 
-        bool mergedSingleMesh = false;
         glbopt::Stats leafOptStats;
-        if (!opt.disableGlbopt)
+        const glbopt::Options leafGlbOpt = BuildLeafGlbOptOptionsForNode(leafTuning);
+        if (!glbopt::OptimizeGlbFile(
+                rawFullGlbPath.string(),
+                fullGlbPath.string(),
+                leafGlbOpt,
+                leafOptStats,
+                "TileHigh"))
         {
-            const glbopt::Options leafGlbOpt = BuildLeafGlbOptOptionsForNode(leafTuning);
-            if (!glbopt::OptimizeGlbFile(
-                    rawFullGlbPath.string(),
-                    fullGlbPath.string(),
-                    leafGlbOpt,
-                    leafOptStats))
-            {
-                std::cerr << "[TilesetEmit] leaf glbopt merge failed tile=" << baseName << "\n";
-                return false;
-            }
-            if (!ValidateTileGeometryStats(leafOptStats, true, baseName))
-            {
-                return false;
-            }
-            mergedSingleMesh = true;
+            std::cerr << "[TilesetEmit] leaf high optimize failed tile=" << baseName << "\n";
+            return false;
         }
-        else
+        if (!ValidateTileGeometryStats(leafOptStats, true, baseName))
         {
-            std::error_code copyErr;
-            std::filesystem::copy_file(
-                rawFullGlbPath,
-                fullGlbPath,
-                std::filesystem::copy_options::overwrite_existing,
-                copyErr);
-            if (copyErr)
-            {
-                return false;
-            }
+            return false;
         }
 
-        std::cout << "[TileExport] tile=" << baseName << " instances=" << composeStats.instances
-                  << " prototypes=" << composeStats.uniquePrototypes
-                  << " materials=" << composeStats.materials
-                  << " mergedMesh=" << (mergedSingleMesh ? "yes" : "no")
-                  << (mergedSingleMesh
-                          ? (" primitivesOut=" + std::to_string(leafOptStats.PrimitiveCountMergedOut) +
-                             " vertsOut=" + std::to_string(leafOptStats.OutputVertexCount))
-                          : "")
-                  << "\n";
+        if (parentCellBounds && parentCellBounds->valid)
+        {
+            const NodeTuning parentTuning = BuildNodeTuning(
+                *parentCellBounds,
+                rootBounds,
+                std::max(0, depthFromRoot - 1),
+                maxDepth,
+                false,
+                opt.viewerTargetSse);
+            const glbopt::Options lowOptions = BuildLowForParentGlbOptOptions(parentTuning);
+            glbopt::Stats lowStats{};
+            if (!glbopt::OptimizeGlbFile(
+                    fullGlbPath.string(),
+                    lowGlbPath.string(),
+                    lowOptions,
+                    lowStats,
+                    "TileLowForParent"))
+            {
+                std::cerr << "[TilesetEmit] leaf low optimize failed tile=" << baseName << "\n";
+                return false;
+            }
+            artifact.LowForParentGlbPath = lowGlbPath;
+        }
+
+        std::cout << "[TileExport] tile=" << baseName << " kind=leaf"
+                  << " materialsCanonical=" << leafOptStats.MaterialCountCanonical
+                  << " materialsInputSlots=" << composeStats.materials
+                  << " tris=" << (leafOptStats.OutputPrimitiveElementCount / 3) << "\n";
 
         std::string sourceLabelSample;
         if (!node.items.empty())
@@ -814,6 +725,7 @@ namespace
             return false;
         }
 
+        artifact.HighGlbPath = fullGlbPath;
         artifact.GlbPath = fullGlbPath;
         artifact.ContentUri = JoinUri(opt.contentSubdir, baseName + ".b3dm");
 
@@ -831,6 +743,7 @@ namespace
         [[maybe_unused]] const core::SceneIR& sceneIr,
         const TilesetEmit::Options& opt,
         BakedNodeArtifact& artifact,
+        const core::Aabb* parentCellBounds,
         int depthFromRoot,
         int maxDepth,
         const core::Aabb& rootBounds,
@@ -843,93 +756,72 @@ namespace
         std::filesystem::create_directories(tilesDir);
 
         const std::filesystem::path proxyGlbPath = tilesDir / (baseName + ".glb");
+        const std::filesystem::path lowGlbPath = tilesDir / (baseName + "__low.glb");
         const std::filesystem::path proxyB3dmPath = tilesDir / (baseName + ".b3dm");
 
-        std::vector<std::string> leafGlbPaths;
-        CollectDescendantLeafOptimizedGlbPaths(node, bakeState, leafGlbPaths);
+        std::vector<std::string> childLowGlbPaths;
+        CollectImmediateChildLowGlbPaths(node, bakeState, childLowGlbPaths);
 
-        if (leafGlbPaths.empty())
+        if (childLowGlbPaths.empty())
         {
             artifact.GlbPath.clear();
             artifact.ContentUri.clear();
             return true;
         }
 
-        // Stable order, drop duplicates (same leaf reachable only once in a tree, but be defensive).
-        {
-            std::vector<std::string> deduped;
-            deduped.reserve(leafGlbPaths.size());
-            std::unordered_set<std::string> seen;
-            for (const std::string& p : leafGlbPaths)
-            {
-                if (seen.insert(p).second)
-                {
-                    deduped.push_back(p);
-                }
-            }
-            leafGlbPaths = std::move(deduped);
-        }
-
-        const NodeTuning proxyTuning = BuildNodeTuning(
-            artifact.bounds,
+        const NodeTuning highTuning = BuildNodeTuning(
+            node.volume,
             rootBounds,
             depthFromRoot,
             maxDepth,
             false,
             opt.viewerTargetSse);
 
-        if (leafGlbPaths.size() == 1)
+        glbopt::Options mergePassOpts = BuildProxyCombineAfterLeafDownscaleOptions(highTuning);
+        mergePassOpts.ForceDoubleSidedMaterials = false;
+        glbopt::Stats proxyStats;
+        if (!glbopt::OptimizeGlbFiles(
+                childLowGlbPaths,
+                proxyGlbPath.string(),
+                mergePassOpts,
+                proxyStats,
+                "ProxyMerge"))
         {
-            std::error_code copyErr;
-            std::filesystem::copy_file(
-                leafGlbPaths.front(),
-                proxyGlbPath,
-                std::filesystem::copy_options::overwrite_existing,
-                copyErr);
-            if (copyErr)
-            {
-                return false;
-            }
-            std::cout << "[ProxyGlbOpt] tile=" << baseName << " mergedLeaves=1 (single descendant)\n";
+            std::cerr << "[TilesetEmit] proxy merge failed tile=" << baseName << "\n";
+            return false;
         }
-        else
+        if (!ValidateTileGeometryStats(proxyStats, true, baseName))
         {
-            glbopt::Options proxyOpts;
-            if (!opt.disableGlbopt)
-            {
-                proxyOpts = BuildMergedInstanceGlbOptOptions(proxyTuning, false);
-                proxyOpts.ForceDoubleSidedMaterials = false;
-            }
-            else
-            {
-                proxyOpts.DeduplicateMaterials = true;
-                proxyOpts.WeldPositions = false;
-                proxyOpts.WeldNormals = false;
-                proxyOpts.WeldTexcoord0 = false;
-                proxyOpts.WeldColor0 = false;
-                proxyOpts.Simplify = false;
-                proxyOpts.RemoveDegenerateByIndex = true;
-                proxyOpts.RemoveDegenerateByArea = true;
-                proxyOpts.DegenerateAreaEpsilonSq = 1e-20f;
-                proxyOpts.OptimizeVertexCache = false;
-                proxyOpts.OptimizeVertexFetch = false;
-                proxyOpts.ForceDoubleSidedMaterials = false;
-            }
+            return false;
+        }
 
-            glbopt::Stats proxyStats;
-            if (!glbopt::OptimizeGlbFiles(leafGlbPaths, proxyGlbPath.string(), proxyOpts, proxyStats))
+        if (parentCellBounds && parentCellBounds->valid)
+        {
+            const NodeTuning parentTuning = BuildNodeTuning(
+                *parentCellBounds,
+                rootBounds,
+                std::max(0, depthFromRoot - 1),
+                maxDepth,
+                false,
+                opt.viewerTargetSse);
+            const glbopt::Options lowOptions = BuildLowForParentGlbOptOptions(parentTuning);
+            glbopt::Stats lowStats{};
+            if (!glbopt::OptimizeGlbFile(
+                    proxyGlbPath.string(),
+                    lowGlbPath.string(),
+                    lowOptions,
+                    lowStats,
+                    "TileLowForParent"))
             {
-                std::cerr << "[TilesetEmit] proxy merge failed tile=" << baseName << "\n";
+                std::cerr << "[TilesetEmit] proxy low optimize failed tile=" << baseName << "\n";
                 return false;
             }
-            if (!ValidateTileGeometryStats(proxyStats, true, baseName))
-            {
-                return false;
-            }
-            std::cout << "[ProxyGlbOpt] tile=" << baseName << " mergedLeaves=" << leafGlbPaths.size()
-                      << " primitivesOut=" << proxyStats.PrimitiveCountMergedOut
-                      << " vertsOut=" << proxyStats.OutputVertexCount << "\n";
+            artifact.LowForParentGlbPath = lowGlbPath;
         }
+        std::cout << "[TileExport] tile=" << baseName << " kind=proxy"
+                  << " children=" << childLowGlbPaths.size()
+                  << " materials=" << proxyStats.MaterialCountCanonical
+                  << " tris=" << (proxyStats.OutputPrimitiveElementCount / 3) << "\n";
 
         const std::map<std::string, std::string> tileMetadata = {
             { "tileId", std::to_string(artifact.nodeId) },
@@ -943,6 +835,7 @@ namespace
             return false;
         }
 
+        artifact.HighGlbPath = proxyGlbPath;
         artifact.GlbPath = proxyGlbPath;
         artifact.ContentUri = JoinUri(opt.contentSubdir, baseName + ".b3dm");
 
@@ -954,6 +847,7 @@ namespace
         const core::SceneIR& sceneIr,
         const TilesetEmit::Options& opt,
         BakeState& bakeState,
+        const core::Aabb* parentCellBounds,
         int depthFromRoot,
         int maxDepth,
         const core::Aabb& rootBounds)
@@ -970,6 +864,7 @@ namespace
                     sceneIr,
                     opt,
                     bakeState,
+                    &node.volume,
                     depthFromRoot + 1,
                     maxDepth,
                     rootBounds))
@@ -982,15 +877,6 @@ namespace
         artifact.nodeId = bakeState.nextNodeId++;
         artifact.isLeaf = !HasAnyChild(node);
         artifact.bounds = node.volume;
-
-        if (opt.useTightBounds)
-        {
-            const core::Aabb tight = ComputeTightBounds(node, sceneIr);
-            if (tight.valid)
-            {
-                artifact.bounds = tight;
-            }
-        }
 
         {
             const std::string tileLabel = opt.tileFilePrefix + std::to_string(artifact.nodeId);
@@ -1009,30 +895,23 @@ namespace
                 sceneIr,
                 opt,
                 artifact,
+                parentCellBounds,
                 depthFromRoot,
                 maxDepth,
                 rootBounds);
         }
         else
         {
-            if (opt.contentOnlyAtLeaves)
-            {
-                artifact.GlbPath.clear();
-                artifact.ContentUri.clear();
-                ok = true;
-            }
-            else
-            {
-                ok = BakeInternalProxyArtifact(
-                    node,
-                    sceneIr,
-                    opt,
-                    artifact,
-                    depthFromRoot,
-                    maxDepth,
-                    rootBounds,
-                    bakeState);
-            }
+            ok = BakeInternalProxyArtifact(
+                node,
+                sceneIr,
+                opt,
+                artifact,
+                parentCellBounds,
+                depthFromRoot,
+                maxDepth,
+                rootBounds,
+                bakeState);
         }
 
         if (!ok)
@@ -1045,7 +924,7 @@ namespace
     }
 
     static void EmitJsonNode(
-        std::ostringstream& ss,
+        std::ostream& out,
         const TileOctree::Node& node,
         const BakeState& bakeState,
         int depth,
@@ -1066,23 +945,23 @@ namespace
 
         const BakedNodeArtifact& artifact = it->second;
 
-        Indent(ss, depth);
-        ss << "{\n";
+        Indent(out, depth);
+        out << "{\n";
 
-        Indent(ss, depth + 1);
-        ss << "\"boundingVolume\":{\"box\":[";
+        Indent(out, depth + 1);
+        out << "\"boundingVolume\":{\"box\":[";
         const std::array<double, 12> box = ToTilesBoxGltfSpace(artifact.bounds);
         for (int i = 0; i < 12; ++i)
         {
             if (i)
             {
-                ss << ",";
+                out << ",";
             }
-            ss << std::setprecision(15) << box[static_cast<std::size_t>(i)];
+            out << std::setprecision(15) << box[static_cast<std::size_t>(i)];
         }
-        ss << "]}," << "\n";
+        out << "]}," << "\n";
 
-        Indent(ss, depth + 1);
+        Indent(out, depth + 1);
         double geometricError = 0.0;
         if (!artifact.isLeaf)
         {
@@ -1101,16 +980,16 @@ namespace
             }
         }
 
-        ss << "\"geometricError\":" << std::setprecision(15) << geometricError << ",\n";
+        out << "\"geometricError\":" << std::setprecision(15) << geometricError << ",\n";
 
-        Indent(ss, depth + 1);
-        ss << "\"refine\":\"REPLACE\"";
+        Indent(out, depth + 1);
+        out << "\"refine\":\"REPLACE\"";
 
         if (!artifact.ContentUri.empty())
         {
-            ss << ",\n";
-            Indent(ss, depth + 1);
-            ss << "\"content\":{\"uri\":\"" << artifact.ContentUri << "\"}";
+            out << ",\n";
+            Indent(out, depth + 1);
+            out << "\"content\":{\"uri\":\"" << artifact.ContentUri << "\"}";
         }
 
         std::vector<const TileOctree::Node*> children;
@@ -1125,14 +1004,14 @@ namespace
 
         if (!children.empty())
         {
-            ss << ",\n";
-            Indent(ss, depth + 1);
-            ss << "\"children\":[\n";
+            out << ",\n";
+            Indent(out, depth + 1);
+            out << "\"children\":[\n";
 
             for (std::size_t i = 0; i < children.size(); ++i)
             {
                 EmitJsonNode(
-                    ss,
+                    out,
                     *children[i],
                     bakeState,
                     depth + 2,
@@ -1144,18 +1023,18 @@ namespace
                     false);
                 if (i + 1 < children.size())
                 {
-                    ss << ",";
+                    out << ",";
                 }
-                ss << "\n";
+                out << "\n";
             }
 
-            Indent(ss, depth + 1);
-            ss << "]";
+            Indent(out, depth + 1);
+            out << "]";
         }
 
-        ss << "\n";
-        Indent(ss, depth);
-        ss << "}";
+        out << "\n";
+        Indent(out, depth);
+        out << "}";
     }
 }
 
@@ -1182,11 +1061,19 @@ namespace TilesetEmit
                 *opt.sceneIr,
                 opt,
                 bakeState,
+                nullptr,
                 0,
                 maxDepth,
                 rootBounds))
         {
             return false;
+        }
+
+        {
+            const std::uint32_t maxTileId =
+                bakeState.nextNodeId > 0 ? bakeState.nextNodeId - 1u : 0u;
+            std::cout << "[TileExport] baked " << bakeState.artifacts.size() << " tiles (tile ids 0.."
+                      << maxTileId << "); writing tileset.json\n";
         }
 
         std::unordered_map<const TileOctree::Node*, BakedNodeArtifact>::const_iterator rootIt =
@@ -1206,14 +1093,22 @@ namespace TilesetEmit
             opt.viewerTargetSse);
         const double rootGeometricError = rootTuning.GeometricError;
 
-        std::ostringstream ss;
-        ss << "{\n";
-        ss << "  \"asset\":{\"version\":\"1.0\"},\n";
-        ss << "  \"geometricError\":" << std::setprecision(15) << rootGeometricError << ",\n";
-        ss << "  \"root\":\n";
+        const std::filesystem::path tilesetPath =
+            std::filesystem::path(opt.tilesetOutDir) / "tileset.json";
+
+        std::ofstream f(tilesetPath);
+        if (!f)
+        {
+            return false;
+        }
+
+        f << "{\n";
+        f << "  \"asset\":{\"version\":\"1.0\"},\n";
+        f << "  \"geometricError\":" << std::setprecision(15) << rootGeometricError << ",\n";
+        f << "  \"root\":\n";
 
         EmitJsonNode(
-            ss,
+            f,
             tree.Root(),
             bakeState,
             2,
@@ -1224,18 +1119,9 @@ namespace TilesetEmit
             rootGeometricError,
             true);
 
-        ss << "\n}\n";
-
-        const std::filesystem::path tilesetPath =
-            std::filesystem::path(opt.tilesetOutDir) / "tileset.json";
-
-        std::ofstream f(tilesetPath);
-        if (!f)
-        {
-            return false;
-        }
-
-        f << ss.str();
+        f << "\n}\n";
+        f.flush();
+        std::cout << "[TileExport] wrote tileset.json (" << tilesetPath.string() << ")\n";
         return true;
     }
 }

@@ -176,11 +176,14 @@ int main()
         return 1;
     }
     glbopt::Stats invalidStats;
+    glbopt::Options invalidOpts;
+    invalidOpts.MaxTriangles = 0;
     const bool invalidOk = glbopt::OptimizeGlbFile(
         invalidIn.string(),
         invalidOut.string(),
-        glbopt::Options{},
-        invalidStats);
+        invalidOpts,
+        invalidStats,
+        "ProbeInvalid");
     if (invalidOk || invalidStats.DroppedPrimitivesInvalidIndices == 0)
     {
         std::cerr << "[probe] expected invalid-index primitive rejection\n";
@@ -206,7 +209,14 @@ int main()
     mirrorOptions.OptimizeOverdraw = false;
     mirrorOptions.OptimizeVertexFetch = false;
     mirrorOptions.Simplify = false;
-    if (!glbopt::OptimizeGlbFile(mirrorIn.string(), mirrorOut.string(), mirrorOptions))
+    mirrorOptions.MaxTriangles = 0;
+    glbopt::Stats mirrorStats;
+    if (!glbopt::OptimizeGlbFile(
+            mirrorIn.string(),
+            mirrorOut.string(),
+            mirrorOptions,
+            mirrorStats,
+            "ProbeMirror"))
     {
         std::cerr << "[probe] mirrored transform optimize failed\n";
         return 1;

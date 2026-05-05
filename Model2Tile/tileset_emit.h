@@ -15,11 +15,7 @@ namespace TilesetEmit
         std::string contentSubdir = "tiles";   // where .b3dm goes relative to tileset.json
         std::string tileFilePrefix = "tile_";  // tile_0.b3dm, tile_1.b3dm...
         bool keepGlbFilesForDebug = false;
-        bool disableGlbopt = false;
         double viewerTargetSse = 80.0;
-
-        bool useTightBounds = false;          // union of subtree item bounds (slower but better)
-        bool contentOnlyAtLeaves = false;     // generally keep false with promotion rule
 
         // Pre-baked high/low GLB links are read from SceneIR instances.
         double instanceMinSizeRatio = 1e-3;   // min (instance diagonal / tile diagonal); 0 = no cull

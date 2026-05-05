@@ -15,7 +15,6 @@
 #include "importers/step_occurrence.h"
 #include "octree.h"
 #include "importers/step_glb_export.h"
-#include "b3dm.h"
 #include "glbopt.h"
 #include "tileset_emit.h"
 #include "importers/step_instance_lod.h"
@@ -99,7 +98,6 @@ int RunStepPipeline(const CliOptions& cli)
 {
     try
     {
-        glbopt::SetVerboseLogging(true);
         ConfigureFidelityArtifactOutput(cli.fidelityArtifactsDir.string());
 
         const std::filesystem::path inputPath = cli.inputPath;
@@ -262,7 +260,7 @@ int RunStepPipeline(const CliOptions& cli)
         const double rootMaxSide = BoundsMaxSideLength(globalBoundsAabb);
 
         TileOctree::Config cfg;
-        cfg.maxDepth = 10;
+        cfg.maxDepth = 20;
         cfg.maxItemsPerNode = 96;
         cfg.maxTrianglesPerNode = 30000;
         cfg.minNodeMaxSide = std::max(1e-6, rootMaxSide * 1e-3);
@@ -326,9 +324,6 @@ int RunStepPipeline(const CliOptions& cli)
         opt.contentSubdir = cli.contentSubdir;
         opt.tileFilePrefix = cli.tilePrefix;
         opt.keepGlbFilesForDebug = cli.keepGlb;
-        opt.useTightBounds = cli.useTightBounds;
-        opt.contentOnlyAtLeaves = cli.contentOnlyAtLeaves;
-        opt.disableGlbopt = cli.disableGlbopt;
         opt.viewerTargetSse = cli.viewerTargetSse;
         opt.instanceMinSizeRatio = cli.instanceMinSizeRatio;
         opt.sceneIr = &sceneIr;
@@ -337,7 +332,6 @@ int RunStepPipeline(const CliOptions& cli)
                   << " contentSubdir=" << opt.contentSubdir
                   << " tilePrefix=" << opt.tileFilePrefix
                   << " keepGlb=" << (opt.keepGlbFilesForDebug ? "true" : "false")
-                  << " disableGlbopt=" << (opt.disableGlbopt ? "true" : "false")
                   << " viewerTargetSse=" << opt.viewerTargetSse
                   << " instanceMinSizeRatio=" << opt.instanceMinSizeRatio << "\n";
 

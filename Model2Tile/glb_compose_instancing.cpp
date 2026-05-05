@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <functional>
 #include <iostream>
@@ -488,6 +489,76 @@ bool AppendGltfModel(tinygltf::Model& dest, const tinygltf::Model& src, int& out
     }
     return true;
 }
+
+static std::size_t AlignUpSize(std::size_t value, std::size_t alignment)
+{
+    if (alignment == 0)
+    {
+        return value;
+    }
+    const std::size_t rem = value % alignment;
+    return rem == 0 ? value : value + (alignment - rem);
+}
+
+/// Concatenate all buffers into index 0 so GLB output uses one BIN chunk and stays within
+/// uint32 size limits (tinygltf embeds extra buffers as base64 in JSON otherwise).
+static bool ConsolidateGltfBuffersToSingle(tinygltf::Model& model, std::string& outError)
+{
+    outError.clear();
+    if (model.buffers.size() <= 1)
+    {
+        return true;
+    }
+    constexpr std::size_t kAlign = 8;
+    const std::size_t bufCount = model.buffers.size();
+    std::vector<std::size_t> base(bufCount, 0);
+    std::size_t total = 0;
+    for (std::size_t i = 0; i < bufCount; ++i)
+    {
+        if (i > 0)
+        {
+            total = AlignUpSize(total, kAlign);
+        }
+        base[i] = total;
+        const std::size_t chunk = model.buffers[i].data.size();
+        total += chunk;
+        if (chunk == 0 && i + 1 < bufCount)
+        {
+            total += kAlign;
+        }
+    }
+
+    std::vector<unsigned char> combined(total, 0);
+    for (std::size_t i = 0; i < bufCount; ++i)
+    {
+        const std::vector<unsigned char>& src = model.buffers[i].data;
+        if (!src.empty())
+        {
+            if (base[i] + src.size() > combined.size())
+            {
+                outError = "consolidate internal size mismatch";
+                return false;
+            }
+            std::memcpy(combined.data() + base[i], src.data(), src.size());
+        }
+    }
+    for (tinygltf::BufferView& bv : model.bufferViews)
+    {
+        if (bv.buffer < 0 || static_cast<std::size_t>(bv.buffer) >= bufCount)
+        {
+            outError = "bufferView references invalid buffer index";
+            return false;
+        }
+        const std::size_t bidx = static_cast<std::size_t>(bv.buffer);
+        bv.byteOffset = base[bidx] + bv.byteOffset;
+        bv.buffer = 0;
+    }
+    tinygltf::Buffer one;
+    one.data = std::move(combined);
+    model.buffers.clear();
+    model.buffers.push_back(std::move(one));
+    return true;
+}
 } // namespace
 
 namespace glb_compose
@@ -582,12 +653,19 @@ bool ComposeInstancedLeafGlb(
         outStats->materials = combined.materials.size();
     }
 
+    if (!ConsolidateGltfBuffersToSingle(combined, outError))
+    {
+        outError = "buffer consolidation failed: " + outError;
+        return false;
+    }
+
     tinygltf::TinyGLTF writer;
     if (!writer.WriteGltfSceneToFile(&combined, outputGlbPath, true, true, true, true))
     {
         outError = "WriteGltfSceneToFile failed: " + outputGlbPath;
         return false;
     }
+
     return true;
 }
 } // namespace glb_compose

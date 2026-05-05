@@ -322,8 +322,6 @@ tiles.addEventListener?.("load-tileset", () => {
     if (didFrame && hud) {
       hud.textContent =
         "Loaded tileset — WASD/RF to fly, mouse drag to look";
-
-      //showRootBox();
     }
   }
   console.log("tileset loaded");
@@ -808,7 +806,6 @@ window.addEventListener("keydown", (event) => {
 function animate() {
   requestAnimationFrame(animate);
 
- // frameToGeometry();
   const delta = clock.getDelta();
 
   controls.update(delta);
@@ -820,31 +817,14 @@ function animate() {
 
   let meshCount = 0;
   let triCount = 0;
-  let hiddenMeshCount = 0;
-  let blackMaterialCount = 0;
 
   tiles.group.traverse((o) => {
     if (o.isMesh) {
       meshCount++;
 
-      if (!o.visible) {
-        hiddenMeshCount++;
-      }
-
       const g = o.geometry;
       if (g && g.index) triCount += g.index.count / 3;
       else if (g && g.attributes?.position) triCount += g.attributes.position.count / 3;
-
-      if (debugState.mode === "original" && o.material) {
-        for (const material of getMaterialList(o.material)) {
-          if (!material || !material.color) continue;
-          const colorMagnitude = material.color.r + material.color.g + material.color.b;
-          const hasColorMap = !!material.map;
-          if (!hasColorMap && colorMagnitude < 0.12) {
-            blackMaterialCount++;
-          }
-        }
-      }
     }
   });
 
@@ -888,8 +868,6 @@ function animate() {
     `${loadingLine}\n` +
     `Meshes: ${meshCount} | Triangles: ~${Math.floor(triCount)}\n` +
     `Leaf tiles: ${visibleLeafTiles.size} | Proxy tiles: ${visibleProxyTiles.size}`;
-
-  //updateGeometryBounds();
 }
 
 animate();

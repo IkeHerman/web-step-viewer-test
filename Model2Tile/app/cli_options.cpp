@@ -24,14 +24,8 @@ void PrintUsage(const char* programName)
         << "                               Emit importer fidelity evidence artifacts to directory\n"
         << "      --viewer-target-sse <num> Viewer-aligned target SSE for export tessellation\n"
         << "                               (default: 80)\n"
-        << "      --disable-glbopt         Bypass glbopt optimization passes\n"
-        << "      --enable-glbopt          Run glbopt optimization passes (default)\n"
         << "      --keep-glb               Keep intermediate .glb files\n"
         << "      --discard-glb            Delete intermediate .glb files after wrap\n"
-        << "      --tight-bounds           Enable tight tile bounds (default)\n"
-        << "      --no-tight-bounds        Disable tight tile bounds\n"
-        << "      --content-only-leaves    Emit content only at leaves\n"
-        << "      --content-all-levels     Allow content at internal levels (default)\n"
         << "      --instance-min-size-ratio <x>\n"
         << "                               Min occurrenceDiag/tileDiag to include (default 1e-3; 0=no cull)\n"
         << "  -v, --verbose                Open CASCADE STEP transfer checks (IFSelect::PrintCheckTransfer)\n"
@@ -128,14 +122,6 @@ bool ParseCli(int argc, char** argv, CliOptions& out, int& outExitCode)
             }
             out.viewerTargetSse = std::stod(value);
         }
-        else if (arg == "--disable-glbopt")
-        {
-            out.disableGlbopt = true;
-        }
-        else if (arg == "--enable-glbopt")
-        {
-            out.disableGlbopt = false;
-        }
         else if (arg == "--keep-glb")
         {
             out.keepGlb = true;
@@ -143,22 +129,6 @@ bool ParseCli(int argc, char** argv, CliOptions& out, int& outExitCode)
         else if (arg == "--discard-glb")
         {
             out.keepGlb = false;
-        }
-        else if (arg == "--tight-bounds")
-        {
-            out.useTightBounds = true;
-        }
-        else if (arg == "--no-tight-bounds")
-        {
-            out.useTightBounds = false;
-        }
-        else if (arg == "--content-only-leaves")
-        {
-            out.contentOnlyAtLeaves = true;
-        }
-        else if (arg == "--content-all-levels")
-        {
-            out.contentOnlyAtLeaves = false;
         }
         else if (arg == "-v" || arg == "--verbose")
         {

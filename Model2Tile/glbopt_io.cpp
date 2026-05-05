@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <cmath>
-#include <cstring>
 #include <filesystem>
 #include <iostream>
 #include <limits>
@@ -389,7 +388,7 @@ namespace glbopt
 
             const bool ok = gltf.LoadBinaryFromFile(&outModel, &err, &warn, inputPath);
 
-            if (!warn.empty() && glbopt::IsVerboseLogging())
+            if (!warn.empty())
             {
                 std::cout << "[glbopt] warn: " << warn << "\n";
             }
@@ -408,14 +407,14 @@ namespace glbopt
             return gltf.WriteGltfSceneToFile(&model, outputPath, true, true, false, true);
         }
 
-        void PrintStats(const Stats& stats, const std::string& label)
+        void PrintStats(
+            const Stats& stats,
+            const std::string& inputLabel,
+            const std::string& outputLabel,
+            const std::string& passTag)
         {
-            if (!glbopt::IsVerboseLogging())
-            {
-                return;
-            }
-
-            const std::string fileName = std::filesystem::path(label).filename().string();
+            const std::string inputFile = std::filesystem::path(inputLabel).filename().string();
+            const std::string outputFile = std::filesystem::path(outputLabel).filename().string();
             const std::uint64_t trisIn = stats.InputPrimitiveElementCount / 3;
             const std::uint64_t trisOut = stats.OutputPrimitiveElementCount / 3;
 
@@ -427,21 +426,14 @@ namespace glbopt
             const long long roundedPct = static_cast<long long>(std::llround(std::abs(changePct)));
             const char* changeWord = (changePct >= 0.0) ? "Reduction" : "Increase";
 
-            std::cout << "[glbopt] file=" << fileName
-                      << " matsIn=" << stats.MaterialCountInput
-                      << " matsCanon=" << stats.MaterialCountCanonical
-                      << " matRemap=" << stats.MaterialSlotsRemapped
-                      << " vertsIn=" << stats.InputVertexCount
-                      << " vertsOut=" << stats.OutputVertexCount
-                      << " mergedVerts=" << stats.MergedVertexCount
-                      << " trisIn=" << trisIn
-                      << " trisOut=" << trisOut
-                      << " badPrimAccessor=" << stats.DroppedPrimitivesInvalidAccessor
-                      << " badPrimIndices=" << stats.DroppedPrimitivesInvalidIndices
-                      << " badTriIndices=" << stats.DroppedTrianglesInvalidIndices
-                      << " badIdxRemap=" << stats.DroppedIndicesInvalidRemap
-                      << " " << roundedPct << "% " << changeWord
-                      << "\n";
+            const long long wNeg = -static_cast<long long>(stats.TrianglesRemovedWeldPhase);
+            const long long sNeg = -static_cast<long long>(stats.TrianglesRemovedSimplify);
+            const long long bNeg = -static_cast<long long>(stats.TrianglesRemovedMaxBudget);
+
+            std::cout << "[glbopt][" << passTag << "] in=" << inputFile
+                      << " out=" << outputFile << " Tris: " << trisOut
+                      << " (W:" << wNeg << " S:" << sNeg << " B:" << bNeg << ") " << roundedPct << "% "
+                      << changeWord << "\n";
         }
     }
 }

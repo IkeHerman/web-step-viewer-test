@@ -4,14 +4,16 @@
 #include <cmath>
 #include <cstddef>
 #include <functional>
+#include <filesystem>
+#include <string>
+#include <system_error>
 #include <unordered_map>
+#include <vector>
 
 namespace glbopt
 {
     namespace
     {
-        bool g_glboptVerboseLogging = false;
-
         int EnsureDefaultMaterial(tinygltf::Model& model)
         {
             tinygltf::Material material;
@@ -91,16 +93,6 @@ namespace glbopt
             }
             return false;
         }
-    }
-
-    void SetVerboseLogging(bool enabled)
-    {
-        g_glboptVerboseLogging = enabled;
-    }
-
-    bool IsVerboseLogging()
-    {
-        return g_glboptVerboseLogging;
     }
 
     namespace
@@ -703,9 +695,17 @@ namespace glbopt
             tinygltf::Mesh outMesh;
             outMesh.name = "merged-optimized";
 
-            for (auto& kv : groups)
+            std::vector<internal::PrimitiveMergeKey> sortedKeys;
+            sortedKeys.reserve(groups.size());
+            for (const auto& kv : groups)
             {
-                internal::PrimitiveData& merged = kv.second;
+                sortedKeys.push_back(kv.first);
+            }
+            std::sort(sortedKeys.begin(), sortedKeys.end());
+
+            for (const internal::PrimitiveMergeKey& key : sortedKeys)
+            {
+                internal::PrimitiveData& merged = groups.at(key);
 
                 if (options.ForceDefaultMaterialForMissing)
                 {
@@ -715,7 +715,16 @@ namespace glbopt
                     }
                 }
 
-                internal::OptimizePrimitiveData(merged, options, ioStats);
+                internal::PreparePrimitiveData(merged, options, ioStats);
+            }
+
+            internal::ApplyGlobalMaxTriangles(groups, options, ioStats);
+
+            for (const internal::PrimitiveMergeKey& key : sortedKeys)
+            {
+                internal::PrimitiveData& merged = groups.at(key);
+
+                internal::FinalizePrimitiveData(merged, options, ioStats);
 
                 tinygltf::Primitive outPrimitive;
                 if (!internal::RewritePrimitive(ioModel, outPrimitive, merged))
@@ -756,7 +765,8 @@ namespace glbopt
         const std::string& inputPath,
         const std::string& outputPath,
         const Options& options,
-        Stats& outStats)
+        Stats& outStats,
+        const std::string& passTag)
     {
         outStats = Stats{};
 
@@ -803,41 +813,77 @@ namespace glbopt
             return false;
         }
 
-        if (IsVerboseLogging())
-        {
-            internal::PrintStats(outStats, inputPath);
-        }
+        internal::PrintStats(outStats, inputPath, outputPath, passTag);
         return true;
-    }
-
-    bool OptimizeGlbFile(
-        const std::string& inputPath,
-        const std::string& outputPath,
-        const Options& options)
-    {
-        Stats stats;
-        return OptimizeGlbFile(inputPath, outputPath, options, stats);
-    }
-
-    bool OptimizeGlbFile(
-        const std::string& inputPath,
-        const std::string& outputPath)
-    {
-        Options options;
-        return OptimizeGlbFile(inputPath, outputPath, options);
     }
 
     bool OptimizeGlbFiles(
         const std::vector<std::string>& inputPaths,
         const std::string& outputPath,
         const Options& options,
-        Stats& outStats)
+        Stats& outStats,
+        const std::string& passTag)
     {
         outStats = Stats{};
 
         if (inputPaths.empty())
         {
             return false;
+        }
+
+        if (inputPaths.size() == 1)
+        {
+            return OptimizeGlbFile(inputPaths.front(), outputPath, options, outStats, passTag);
+        }
+
+        // Merging N>2 inputs in one pass keeps all geometry in `groups` at once (O(sum inputs)),
+        // which can OOM on large proxy merges. Merge pairwise via temp GLBs to cap peak memory.
+        if (inputPaths.size() > 2)
+        {
+            namespace fs = std::filesystem;
+            const fs::path outPathFs(outputPath);
+            fs::path workDir = outPathFs.parent_path();
+            if (workDir.empty())
+            {
+                workDir = fs::path(".");
+            }
+
+            std::string acc = inputPaths.front();
+            bool accIsTemp = false;
+
+            for (std::size_t i = 1; i < inputPaths.size(); ++i)
+            {
+                const bool last = (i + 1 == inputPaths.size());
+                const std::string dest =
+                    last ? outputPath
+                         : (workDir / (std::string(".glbopt_chain_") + std::to_string(i) + ".glb"))
+                               .string();
+
+                if (!OptimizeGlbFiles(std::vector<std::string>{acc, inputPaths[i]}, dest, options, outStats, passTag))
+                {
+                    std::error_code ec;
+                    if (accIsTemp)
+                    {
+                        fs::remove(acc, ec);
+                    }
+                    if (!last)
+                    {
+                        fs::remove(dest, ec);
+                    }
+                    return false;
+                }
+
+                if (accIsTemp)
+                {
+                    std::error_code ec;
+                    fs::remove(acc, ec);
+                }
+
+                acc = dest;
+                accIsTemp = !last;
+            }
+
+            return true;
         }
 
         Stats combinedStats{};
@@ -850,8 +896,9 @@ namespace glbopt
 
         std::unordered_map<internal::PrimitiveMergeKey, internal::PrimitiveData, internal::PrimitiveMergeKeyHasher> groups;
 
-        for (const std::string& inputPath : inputPaths)
+        for (std::size_t inputIndex = 0; inputIndex < inputPaths.size(); ++inputIndex)
         {
+            const std::string& inputPath = inputPaths[inputIndex];
             tinygltf::Model sourceModel;
             if (!internal::LoadGlb(inputPath, sourceModel))
             {
@@ -895,30 +942,7 @@ namespace glbopt
         }
 
         outStats = combinedStats;
+        internal::PrintStats(outStats, outputPath, outputPath, passTag);
         return true;
-    }
-
-    bool OptimizeGlbFiles(
-        const std::vector<std::string>& inputPaths,
-        const std::string& outputPath,
-        const Options& options)
-    {
-        Stats combinedStats;
-        const bool ok = OptimizeGlbFiles(inputPaths, outputPath, options, combinedStats);
-        if (!ok)
-        {
-            return false;
-        }
-
-        internal::PrintStats(combinedStats, outputPath);
-        return true;
-    }
-
-    bool OptimizeGlbFiles(
-        const std::vector<std::string>& inputPaths,
-        const std::string& outputPath)
-    {
-        Options options;
-        return OptimizeGlbFiles(inputPaths, outputPath, options);
     }
 }

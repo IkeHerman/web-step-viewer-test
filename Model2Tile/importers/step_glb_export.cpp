@@ -38,10 +38,14 @@
 #include <gp_Pnt.hxx>
 
 #include "../dep/tinygltf/tiny_gltf.h"
+#include "../tiler/node_scale_helpers.h"
 
 namespace
 {
 std::filesystem::path g_fidelityArtifactDirectory;
+
+/// Halve OCCT linear/angular deflections => ~2x denser meshes (temporary default).
+constexpr double kTessellationDensityBoost = 0.5;
 
 std::string JsonEscape(const std::string& input)
 {
@@ -286,7 +290,7 @@ ExportResolvedTessellation ResolveExportTessellation(
     const double geomErr = std::max(0.0, policy.tileGeometricError);
     const double relativeError = geomErr / std::max(1e-9, diag);
     const double classBias = (policy.tileClass == ExportTileClass::Proxy) ? 2.4 : 0.55;
-    const double sseScale = std::clamp(out.chosenSse / 80.0, 0.5, 3.0);
+    const double sseScale = model2tile::ClampViewerSseScaleTileDefault(policy.viewerTargetSse);
 
     double linear = diag * std::max(5e-4, relativeError * classBias * policy.qualityBias * sseScale);
     if (geomErr <= 1e-12)
@@ -301,8 +305,8 @@ ExportResolvedTessellation ResolveExportTessellation(
     angular += std::clamp(std::log10(std::max(1e-6, linear / std::max(1e-9, diag))), -2.0, 1.0) * 0.7;
     angular = std::clamp(angular, policy.angularMinDeg, policy.angularMaxDeg);
 
-    out.linearDeflection = linear;
-    out.angularDeflectionDeg = angular;
+    out.linearDeflection = std::max(1e-15, linear * kTessellationDensityBoost);
+    out.angularDeflectionDeg = std::max(1e-6, angular * kTessellationDensityBoost);
     return out;
 }
 
@@ -342,11 +346,13 @@ ExportTessellationPolicy MakeInstanceLowTessellationPolicy(
     constexpr double kGeomErrFraction = 0.65;
     constexpr double kGeomErrMinFraction = 0.25;
     constexpr double kGeomErrMaxFraction = 0.95;
-    const double minErr = nodeDiag * kGeomErrMinFraction;
-    const double maxErr = nodeDiag * kGeomErrMaxFraction;
-    const double sseScale = std::clamp(std::max(1.0, viewerTargetSse) / 80.0, 0.75, 3.0);
-    const double rawErr = nodeDiag * kGeomErrFraction * sseScale;
-    p.tileGeometricError = std::clamp(rawErr, minErr, std::max(minErr, maxErr));
+    const double sseScale = model2tile::ClampViewerSseScale(viewerTargetSse, 0.75, 3.0);
+    p.tileGeometricError = model2tile::ClampDiagonalGeometricError(
+        nodeDiag,
+        sseScale,
+        kGeomErrFraction,
+        kGeomErrMinFraction,
+        kGeomErrMaxFraction);
 
     return p;
 }
@@ -627,9 +633,9 @@ bool ExportBoxToGlbFile(
 
     BRepMesh_IncrementalMesh mesh(
         boxShape,
-        0.25,
+        0.25 * kTessellationDensityBoost,
         Standard_False,
-        8.0,
+        8.0 * kTessellationDensityBoost,
         Standard_True);
     mesh.Perform();
 
