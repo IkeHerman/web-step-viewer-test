@@ -21,6 +21,37 @@ namespace glbopt
             return static_cast<int>(model.materials.size() - 1);
         }
 
+        /// True when the glTF material samples any texture using TEXCOORD set 0.
+        static bool MaterialUsesTexCoord0OnMaterial(const tinygltf::Model& model, int materialIndex)
+        {
+            if (materialIndex < 0 || materialIndex >= static_cast<int>(model.materials.size()))
+            {
+                return false;
+            }
+            const tinygltf::Material& m = model.materials[static_cast<std::size_t>(materialIndex)];
+            const tinygltf::PbrMetallicRoughness& pbr = m.pbrMetallicRoughness;
+            const auto tiUses0 = [](const tinygltf::TextureInfo& ti) {
+                return ti.index >= 0 && ti.texCoord == 0;
+            };
+            if (tiUses0(pbr.baseColorTexture) || tiUses0(pbr.metallicRoughnessTexture))
+            {
+                return true;
+            }
+            if (m.normalTexture.index >= 0 && m.normalTexture.texCoord == 0)
+            {
+                return true;
+            }
+            if (m.occlusionTexture.index >= 0 && m.occlusionTexture.texCoord == 0)
+            {
+                return true;
+            }
+            if (tiUses0(m.emissiveTexture))
+            {
+                return true;
+            }
+            return false;
+        }
+
         template<typename T>
         static void AppendBytes(std::vector<unsigned char>& dst, const std::vector<T>& src)
         {
@@ -132,6 +163,9 @@ namespace glbopt
                 return false;
             }
 
+            const bool emitTexcoord =
+                data.HasTexcoord0 && MaterialUsesTexCoord0OnMaterial(model, data.Material);
+
             std::vector<float> positions;
             std::vector<float> normals;
             std::vector<float> texcoords;
@@ -157,7 +191,7 @@ namespace glbopt
                 }
             }
 
-            if (data.HasTexcoord0)
+            if (emitTexcoord)
             {
                 texcoords.reserve(data.Vertices.size() * 2);
                 for (const PackedVertex& v : data.Vertices)
@@ -193,7 +227,7 @@ namespace glbopt
                 AppendBytes(vertexBytes, normals);
             }
 
-            if (data.HasTexcoord0)
+            if (emitTexcoord)
             {
                 uvOffset = vertexBytes.size();
                 AppendBytes(vertexBytes, texcoords);
@@ -234,7 +268,7 @@ namespace glbopt
                     "NORMAL");
             }
 
-            if (data.HasTexcoord0)
+            if (emitTexcoord)
             {
                 uvView = AddBufferView(
                     model,
@@ -295,7 +329,7 @@ namespace glbopt
                     "NORMAL");
             }
 
-            if (data.HasTexcoord0)
+            if (emitTexcoord)
             {
                 primitive.attributes["TEXCOORD_0"] = AddAccessor(
                     model,

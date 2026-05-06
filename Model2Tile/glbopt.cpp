@@ -836,56 +836,6 @@ namespace glbopt
             return OptimizeGlbFile(inputPaths.front(), outputPath, options, outStats, passTag);
         }
 
-        // Merging N>2 inputs in one pass keeps all geometry in `groups` at once (O(sum inputs)),
-        // which can OOM on large proxy merges. Merge pairwise via temp GLBs to cap peak memory.
-        if (inputPaths.size() > 2)
-        {
-            namespace fs = std::filesystem;
-            const fs::path outPathFs(outputPath);
-            fs::path workDir = outPathFs.parent_path();
-            if (workDir.empty())
-            {
-                workDir = fs::path(".");
-            }
-
-            std::string acc = inputPaths.front();
-            bool accIsTemp = false;
-
-            for (std::size_t i = 1; i < inputPaths.size(); ++i)
-            {
-                const bool last = (i + 1 == inputPaths.size());
-                const std::string dest =
-                    last ? outputPath
-                         : (workDir / (std::string(".glbopt_chain_") + std::to_string(i) + ".glb"))
-                               .string();
-
-                if (!OptimizeGlbFiles(std::vector<std::string>{acc, inputPaths[i]}, dest, options, outStats, passTag))
-                {
-                    std::error_code ec;
-                    if (accIsTemp)
-                    {
-                        fs::remove(acc, ec);
-                    }
-                    if (!last)
-                    {
-                        fs::remove(dest, ec);
-                    }
-                    return false;
-                }
-
-                if (accIsTemp)
-                {
-                    std::error_code ec;
-                    fs::remove(acc, ec);
-                }
-
-                acc = dest;
-                accIsTemp = !last;
-            }
-
-            return true;
-        }
-
         Stats combinedStats{};
         bool anyTextureInInputs = false;
         bool anyTexcoordInInputs = false;

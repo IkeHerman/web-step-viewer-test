@@ -51,23 +51,34 @@ inline double ClampDiagonalGeometricError(
     return ClampDouble(rawErr, minErr, std::max(minErr, maxErr));
 }
 
-/// Position weld step from node vs root AABB diagonals (glbopt `PositionStep` source).
-inline double ComputeNodeBoxWeldStep(double nodeDiag, double rootDiag)
+/// Fixed world-space weld grid for glbopt vertex quantization (does **not** scale with octree volume).
+/// Conservative: intended only to merge corners separated by float precision / export noise, not by LOD scale.
+inline constexpr double kVertexWeldPositionEpsilonWorld = 1e-6;
+
+inline double GlobalVertexWeldPositionStep()
 {
-    const double safeNodeDiag = std::max(0.0, nodeDiag);
-    const double rootStepMin = std::max(1e-12, rootDiag * 1e-9);
+    return kVertexWeldPositionEpsilonWorld;
+}
 
-    // Coarser than original 2e-4; `PositionStep` scales with node diagonal until `stepMax`.
-    constexpr double kWeldFractionOfNodeDiag = 8e-4;
+/// Normal component weld step derived from positional weld: calibrated so ~1µm positional step ⇒ ~\(10^{-5}\)
+/// normal step (prior fixed default); scales up on large cells, clamped.
+inline double ComputeWeldNormalStepFromPositionStep(double positionStep)
+{
+    constexpr double kRefPos = 1e-6;
+    constexpr double kRefNorm = 1e-5;
+    constexpr double kMin = 8e-7;
+    constexpr double kMax = 8e-3;
+    return ClampDouble(kRefNorm * (positionStep / kRefPos), kMin, kMax);
+}
 
-    const double stepMin = std::max(rootStepMin, safeNodeDiag * 1e-9);
-    // Upper clamp on position weld step: 10× prior `2e-3 * diag` cap (was 0.2% of diagonal, now 2%).
-    const double stepMax = std::max(stepMin, safeNodeDiag * 2e-2);
-
-    return ClampDouble(
-        safeNodeDiag * kWeldFractionOfNodeDiag,
-        stepMin,
-        stepMax);
+/// UV weld step derived from positional weld the same way (texture space is unitless; caps stay conservative).
+inline double ComputeWeldTexcoordStepFromPositionStep(double positionStep)
+{
+    constexpr double kRefPos = 1e-6;
+    constexpr double kRefTc = 1e-7;
+    constexpr double kMin = 1e-9;
+    constexpr double kMax = 3e-4;
+    return ClampDouble(kRefTc * (positionStep / kRefPos), kMin, kMax);
 }
 
 } // namespace model2tile

@@ -81,6 +81,7 @@ SOURCES := \
 	$(SRCDIR)/importers/step_glb_export.cpp \
 	$(SRCDIR)/b3dm.cpp \
 	$(SRCDIR)/tileset_emit.cpp \
+	$(SRCDIR)/gltf_buffer_consolidate.cpp \
 	$(SRCDIR)/glb_compose_instancing.cpp \
 	$(SRCDIR)/tinygltf_imp.cpp \
 	$(SRCDIR)/glbopt.cpp \
@@ -100,8 +101,18 @@ PROJECT_OBJECTS := $(patsubst $(SRCDIR)/%.cpp,$(BUILD_DIR)/%.o,$(SOURCES))
 OBJECTS := $(PROJECT_OBJECTS) $(MESHOPT_OBJECTS)
 DEPS := $(OBJECTS:.o=.d)
 
-.PHONY: all clean analyze-unused
+.PHONY: all clean analyze-unused validate-glb
 all: $(TARGET)
+
+# Validate standalone .glb files under GLB_DIR using Khronos gltf-validator (requires Node.js).
+# Run from this directory; GLB_DIR may be relative to the Makefile directory.
+# Example: make validate-glb GLB_DIR=../Tile-Viewer/public/tiles
+GLB_DIR ?=
+validate-glb:
+	@if ! command -v node >/dev/null 2>&1; then echo "validate-glb: node not found in PATH"; exit 1; fi
+	@if [ -z "$(GLB_DIR)" ]; then echo "usage: make validate-glb GLB_DIR=<directory_with_glb_files>"; exit 1; fi
+	cd $(SRCDIR)/tools/gltf-validate && npm ci --silent
+	cd $(SRCDIR) && node tools/gltf-validate/validate_glb.mjs "$(GLB_DIR)"
 
 # Rebuild with extra static unused-function checks (project + meshoptimizer objects).
 analyze-unused: clean

@@ -54,7 +54,35 @@ namespace glbopt
                 return static_cast<std::int64_t>(bits);
             }
 
-            return static_cast<std::int64_t>(std::llround(static_cast<double>(value / step)));
+            const double vv = static_cast<double>(value);
+            if (!std::isfinite(vv))
+            {
+                std::uint32_t bits = 0;
+                static_assert(sizeof(bits) == sizeof(value), "float size must match uint32_t");
+                std::memcpy(&bits, &value, sizeof(float));
+                return static_cast<std::int64_t>(bits);
+            }
+
+            const double denom = static_cast<double>(step);
+            const double q = vv / denom;
+            if (!std::isfinite(q))
+            {
+                std::uint32_t bits = 0;
+                std::memcpy(&bits, &value, sizeof(float));
+                return static_cast<std::int64_t>(bits);
+            }
+
+            // Never saturate distant coordinates onto one lattice bucket: that welds unrelated
+            // triangles with "valid" indices. Fall back per-float identity instead.
+            constexpr double kLlroundMagLimit =
+                static_cast<double>((std::numeric_limits<std::int64_t>::max)() / 8);
+            if (q > kLlroundMagLimit || q < -kLlroundMagLimit)
+            {
+                std::uint32_t bits = 0;
+                std::memcpy(&bits, &value, sizeof(float));
+                return static_cast<std::int64_t>(bits);
+            }
+            return static_cast<std::int64_t>(std::llround(q));
         }
 
         static QuantizedKey BuildVertexKey(const PackedVertex& v, const Options& options)
@@ -140,16 +168,19 @@ namespace glbopt
             return LengthSquared(cross) <= epsilonSq;
         }
 
-        /// Squared length of `cross(ab, ac)`; monotonic with triangle area (same as degenerate test).
-        static double TriangleCrossLengthSquared(
+        /// Squared length of the longest edge (budget trim drops smallest max-edge triangles first).
+        static double TriangleMaxEdgeLengthSquared(
             const PackedVertex& a,
             const PackedVertex& b,
             const PackedVertex& c)
         {
             const Vec3 ab = Sub(b.Position, a.Position);
-            const Vec3 ac = Sub(c.Position, a.Position);
-            const Vec3 cross = Cross(ab, ac);
-            return static_cast<double>(LengthSquared(cross));
+            const Vec3 bc = Sub(c.Position, b.Position);
+            const Vec3 ca = Sub(a.Position, c.Position);
+            const double lab = static_cast<double>(LengthSquared(ab));
+            const double lbc = static_cast<double>(LengthSquared(bc));
+            const double lca = static_cast<double>(LengthSquared(ca));
+            return std::max(lab, std::max(lbc, lca));
         }
 
         PrimitiveMergeKey MakeMergeKey(const PrimitiveData& primitive)
@@ -272,6 +303,88 @@ namespace glbopt
             ioData.Indices.swap(filtered);
         }
 
+        /// Slop derived from quantization step plus a tiny floor so float noise does not falsely reject.
+        static float WeldAxisSlop(float step)
+        {
+            return std::max(1e-20f, step * 1.02f + 1e-5f);
+        }
+
+        /// Same lattice bucket can still cover corners that must not weld (thin walls, mirrored shells).
+        static bool WeldedCornersCompatible(const PackedVertex& a, const PackedVertex& b, const Options& o)
+        {
+            if (o.WeldPositions)
+            {
+                Vec3 dpos;
+                dpos.X = b.Position.X - a.Position.X;
+                dpos.Y = b.Position.Y - a.Position.Y;
+                dpos.Z = b.Position.Z - a.Position.Z;
+                const float distSq = LengthSquared(dpos);
+                float maxMerge = o.WeldPositionMergeMaxDistance > 0.0f
+                    ? o.WeldPositionMergeMaxDistance
+                    : (o.PositionStep * o.WeldPositionMergeStepFraction);
+                maxMerge = std::max(maxMerge, 1e-20f);
+                if (distSq > maxMerge * maxMerge)
+                {
+                    return false;
+                }
+            }
+
+            if (o.WeldNormals)
+            {
+                if (static_cast<bool>(a.HasNormal) != static_cast<bool>(b.HasNormal))
+                {
+                    return false;
+                }
+                if (a.HasNormal && b.HasNormal)
+                {
+                    const float dot =
+                        a.Normal.X * b.Normal.X + a.Normal.Y * b.Normal.Y + a.Normal.Z * b.Normal.Z;
+                    if (dot <= 0.0f)
+                    {
+                        return false;
+                    }
+                }
+            }
+
+            if (o.WeldTexcoord0)
+            {
+                if (static_cast<bool>(a.HasTexcoord0) != static_cast<bool>(b.HasTexcoord0))
+                {
+                    return false;
+                }
+                if (a.HasTexcoord0 && b.HasTexcoord0)
+                {
+                    const float s = WeldAxisSlop(o.TexcoordStep);
+                    if (std::fabs(a.Texcoord0.X - b.Texcoord0.X) > s ||
+                        std::fabs(a.Texcoord0.Y - b.Texcoord0.Y) > s)
+                    {
+                        return false;
+                    }
+                }
+            }
+
+            if (o.WeldColor0)
+            {
+                if (static_cast<bool>(a.HasColor0) != static_cast<bool>(b.HasColor0))
+                {
+                    return false;
+                }
+                if (a.HasColor0 && b.HasColor0)
+                {
+                    const float s = WeldAxisSlop(o.ColorStep);
+                    if (std::fabs(a.Color0.X - b.Color0.X) > s ||
+                        std::fabs(a.Color0.Y - b.Color0.Y) > s ||
+                        std::fabs(a.Color0.Z - b.Color0.Z) > s ||
+                        std::fabs(a.Color0.W - b.Color0.W) > s)
+                    {
+                        return false;
+                    }
+                }
+            }
+
+            return true;
+        }
+
         static void WeldVertices(
             PrimitiveData& ioData,
             const Options& options,
@@ -285,8 +398,12 @@ namespace glbopt
                 return;
             }
 
-            std::unordered_map<QuantizedKey, std::uint32_t, QuantizedKeyHasher> lookup;
-            lookup.reserve(ioData.Vertices.size() * 2);
+            // One lattice cell can hold several geometrically distinct corners; merge only when
+            // positions/attributes are actually within the intended weld tolerance (and normals
+            // are not opposed), instead of blindly folding every matching key onto the first corner.
+            std::unordered_map<QuantizedKey, std::vector<std::uint32_t>, QuantizedKeyHasher>
+                weldBucket;
+            weldBucket.reserve(ioData.Vertices.size() * 2);
 
             std::vector<PackedVertex> weldedVertices;
             weldedVertices.reserve(ioData.Vertices.size());
@@ -298,26 +415,38 @@ namespace glbopt
             for (std::size_t i = 0; i < ioData.Vertices.size(); ++i)
             {
                 const QuantizedKey key = BuildVertexKey(ioData.Vertices[i], options);
-                const auto it = lookup.find(key);
+                std::vector<std::uint32_t>& candidates = weldBucket[key];
 
-                if (it != lookup.end())
+                const PackedVertex& incoming = ioData.Vertices[i];
+                std::uint32_t chosen = std::numeric_limits<std::uint32_t>::max();
+                for (const std::uint32_t w : candidates)
                 {
-                    remap[i] = it->second;
+                    if (WeldedCornersCompatible(weldedVertices[w], incoming, options))
+                    {
+                        chosen = w;
+                        break;
+                    }
+                }
+
+                if (chosen != std::numeric_limits<std::uint32_t>::max())
+                {
+                    remap[i] = chosen;
                     continue;
                 }
 
                 const std::uint32_t newIndex = static_cast<std::uint32_t>(weldedVertices.size());
-                weldedVertices.push_back(ioData.Vertices[i]);
+                weldedVertices.push_back(incoming);
+                candidates.push_back(newIndex);
                 remap[i] = newIndex;
-                lookup.emplace(key, newIndex);
             }
 
+            const std::uint32_t sentinel = std::numeric_limits<std::uint32_t>::max();
             for (std::uint32_t& idx : ioData.Indices)
             {
-                if (idx >= remap.size() || remap[idx] == std::numeric_limits<std::uint32_t>::max())
+                if (idx >= remap.size())
                 {
                     ++stats.DroppedIndicesInvalidRemap;
-                    idx = 0;
+                    idx = sentinel;
                     continue;
                 }
                 idx = remap[idx];
@@ -423,7 +552,10 @@ namespace glbopt
                     newIndices.push_back(b);
                 }
 
-                ioData.Indices.swap(newIndices);
+                if (!newIndices.empty())
+                {
+                    ioData.Indices.swap(newIndices);
+                }
                 return;
             }
 
@@ -464,7 +596,10 @@ namespace glbopt
                 newIndices.push_back(c);
             }
 
-            ioData.Indices.swap(newIndices);
+            if (!newIndices.empty())
+            {
+                ioData.Indices.swap(newIndices);
+            }
         }
 
         /// Packs NORMAL / TEXCOORD_0 / COLOR_0 into a contiguous float buffer for meshopt_simplifyWithAttributes.
@@ -597,6 +732,10 @@ namespace glbopt
                 const std::size_t attrFloatsPerVertex =
                     BuildSimplifyAttributeBuffers(ioData, options, attrData, attrWeights);
 
+                // Avoid meshopt_SimplifyPermissive here: crossing attribute seams can scramble
+                // connectivity while leaving indices nominally valid.
+                const unsigned int simplifyOpts = meshopt_SimplifyPrune;
+
                 std::size_t resultCount = 0;
                 if (attrFloatsPerVertex > 0)
                 {
@@ -614,7 +753,7 @@ namespace glbopt
                         nullptr,
                         targetIndexCount,
                         options.SimplifyError,
-                        0,
+                        simplifyOpts,
                         nullptr);
                 }
                 else
@@ -628,12 +767,42 @@ namespace glbopt
                         sizeof(PackedVertex),
                         targetIndexCount,
                         options.SimplifyError,
-                        0,
+                        simplifyOpts,
                         nullptr);
                 }
 
+                if (options.SimplifySloppyIfStuck && resultCount > targetIndexCount &&
+                    resultCount >= 3u && (resultCount % 3u) == 0u)
+                {
+                    const float sloppyErr =
+                        std::max(options.SimplifyError * 8.0f, 2e-1f);
+                    std::vector<std::uint32_t> sloppyTmp(resultCount);
+                    const size_t sloppyCount = meshopt_simplifySloppy(
+                        sloppyTmp.data(),
+                        simplified.data(),
+                        resultCount,
+                        &ioData.Vertices[0].Position.X,
+                        ioData.Vertices.size(),
+                        sizeof(PackedVertex),
+                        nullptr,
+                        targetIndexCount,
+                        sloppyErr,
+                        nullptr);
+                    if (sloppyCount >= 3u && (sloppyCount % 3u) == 0u && sloppyCount < resultCount)
+                    {
+                        sloppyTmp.resize(sloppyCount);
+                        simplified.swap(sloppyTmp);
+                        resultCount = sloppyCount;
+                    }
+                }
+
                 simplified.resize(resultCount);
-                ioData.Indices.swap(simplified);
+                // meshopt can return 0 indices on tiny or nearly-degenerate meshes; swapping would
+                // empty the primitive and fail the entire GLB merge (e.g. proxy tile_5 with 2 tris).
+                if (resultCount >= 3 && (resultCount % 3u) == 0u)
+                {
+                    ioData.Indices.swap(simplified);
+                }
 
                 const std::size_t trianglesAfterSimplify = ioData.Indices.size() / 3;
                 if (trianglesBeforeSimplify > trianglesAfterSimplify)
@@ -643,44 +812,56 @@ namespace glbopt
                 }
             }
 
-            if (options.OptimizeVertexCache)
+            if (!ioData.Indices.empty())
             {
-                std::vector<std::uint32_t> reordered(ioData.Indices.size());
-                meshopt_optimizeVertexCache(
-                    reordered.data(),
-                    ioData.Indices.data(),
-                    ioData.Indices.size(),
-                    ioData.Vertices.size());
-                ioData.Indices.swap(reordered);
+                if (options.OptimizeVertexCache)
+                {
+                    std::vector<std::uint32_t> reordered(ioData.Indices.size());
+                    meshopt_optimizeVertexCache(
+                        reordered.data(),
+                        ioData.Indices.data(),
+                        ioData.Indices.size(),
+                        ioData.Vertices.size());
+                    ioData.Indices.swap(reordered);
+                }
+
+                if (options.OptimizeOverdraw)
+                {
+                    std::vector<std::uint32_t> reordered(ioData.Indices.size());
+                    meshopt_optimizeOverdraw(
+                        reordered.data(),
+                        ioData.Indices.data(),
+                        ioData.Indices.size(),
+                        &ioData.Vertices[0].Position.X,
+                        ioData.Vertices.size(),
+                        sizeof(PackedVertex),
+                        options.OverdrawThreshold);
+                    ioData.Indices.swap(reordered);
+                }
+
+                if (options.OptimizeVertexFetch)
+                {
+                    std::vector<PackedVertex> fetched(ioData.Vertices.size());
+                    const std::size_t newVertexCount = meshopt_optimizeVertexFetch(
+                        fetched.data(),
+                        ioData.Indices.data(),
+                        ioData.Indices.size(),
+                        ioData.Vertices.data(),
+                        ioData.Vertices.size(),
+                        sizeof(PackedVertex));
+
+                    fetched.resize(newVertexCount);
+                    ioData.Vertices.swap(fetched);
+                }
             }
 
-            if (options.OptimizeOverdraw)
+            // `meshopt_simplify` / `meshopt_simplifySloppy` can leave collapsed index triplets or
+            // needle-thin triangles; reorder passes do not fix that. Cull again using final positions
+            // (after vertex-fetch compaction when enabled).
+            if (!ioData.Indices.empty())
             {
-                std::vector<std::uint32_t> reordered(ioData.Indices.size());
-                meshopt_optimizeOverdraw(
-                    reordered.data(),
-                    ioData.Indices.data(),
-                    ioData.Indices.size(),
-                    &ioData.Vertices[0].Position.X,
-                    ioData.Vertices.size(),
-                    sizeof(PackedVertex),
-                    options.OverdrawThreshold);
-                ioData.Indices.swap(reordered);
-            }
-
-            if (options.OptimizeVertexFetch)
-            {
-                std::vector<PackedVertex> fetched(ioData.Vertices.size());
-                const std::size_t newVertexCount = meshopt_optimizeVertexFetch(
-                    fetched.data(),
-                    ioData.Indices.data(),
-                    ioData.Indices.size(),
-                    ioData.Vertices.data(),
-                    ioData.Vertices.size(),
-                    sizeof(PackedVertex));
-
-                fetched.resize(newVertexCount);
-                ioData.Vertices.swap(fetched);
+                CullInvalidIndexReferences(ioData, stats);
+                CullDegenerates(ioData, options, stats);
             }
         }
 
@@ -701,6 +882,8 @@ namespace glbopt
                 return;
             }
 
+            stats.MaxTrianglesBudgetConfigured = true;
+
             std::size_t total = 0;
             for (const auto& kv : groups)
             {
@@ -714,8 +897,11 @@ namespace glbopt
 
             if (total <= static_cast<std::size_t>(options.MaxTriangles))
             {
+                stats.MaxTrianglesBudgetOverCap = false;
                 return;
             }
+
+            stats.MaxTrianglesBudgetOverCap = true;
 
             const std::size_t dropCount = total - static_cast<std::size_t>(options.MaxTriangles);
 
@@ -738,7 +924,7 @@ namespace glbopt
                     const std::uint32_t ib = pd.Indices[t * 3 + 1];
                     const std::uint32_t ic = pd.Indices[t * 3 + 2];
                     BudgetTriRecord rec;
-                    rec.Metric = TriangleCrossLengthSquared(
+                    rec.Metric = TriangleMaxEdgeLengthSquared(
                         pd.Vertices[ia],
                         pd.Vertices[ib],
                         pd.Vertices[ic]);
@@ -815,12 +1001,44 @@ namespace glbopt
             stats.TrianglesRemovedMaxBudget += dropCount;
         }
 
+        /// meshoptimizer assumes triangle lists are full triplets; dangling indices confuse simplify.
+        static void SanitizeIndexListPrimitiveCount(PrimitiveData& ioData)
+        {
+            if (ioData.Mode == TINYGLTF_MODE_TRIANGLES)
+            {
+                const std::size_t n = ioData.Indices.size();
+                const std::size_t rem = n % 3;
+                if (rem != 0 && n > rem)
+                {
+                    ioData.Indices.resize(n - rem);
+                }
+                else if (rem != 0)
+                {
+                    ioData.Indices.clear();
+                }
+            }
+            else if (ioData.Mode == TINYGLTF_MODE_LINE)
+            {
+                const std::size_t n = ioData.Indices.size();
+                const std::size_t rem = n % 2;
+                if (rem != 0 && n > rem)
+                {
+                    ioData.Indices.resize(n - rem);
+                }
+                else if (rem != 0)
+                {
+                    ioData.Indices.clear();
+                }
+            }
+        }
+
         void PreparePrimitiveData(
             PrimitiveData& ioData,
             const Options& options,
             Stats& stats)
         {
             CullInvalidIndexReferences(ioData, stats);
+            SanitizeIndexListPrimitiveCount(ioData);
             if (options.StripColor0Always)
             {
                 StripVertexColor0(ioData);
@@ -838,6 +1056,8 @@ namespace glbopt
             }
 
             WeldVertices(ioData, options, stats);
+            // Drop any sentinel indices from remap failure (never collapse to vertex 0).
+            CullInvalidIndexReferences(ioData, stats);
             CullDegenerates(ioData, options, stats);
 
             if (trianglesBeforeWeld > 0)

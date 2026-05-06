@@ -3,7 +3,9 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <cstdint>
 #include <iostream>
+#include <stdexcept>
 #include <string>
 
 void PrintUsage(const char* programName)
@@ -28,6 +30,11 @@ void PrintUsage(const char* programName)
         << "      --discard-glb            Delete intermediate .glb files after wrap\n"
         << "      --instance-min-size-ratio <x>\n"
         << "                               Min occurrenceDiag/tileDiag to include (default 1e-3; 0=no cull)\n"
+        << "      --proxy-merge-max-tris <n>\n"
+        << "                               Hard cap on proxy merge MaxTriangles vs 50% leaf-high (default 2M)\n"
+        << "      --proxy-merge-ratio-min-leaf-high-tris <n>\n"
+        << "                               Only apply the 50%% leaf-high ratio budget above this triangle sum\n"
+        << "                               (default 50000; 0 = always apply when leaf-high sum > 0)\n"
         << "  -v, --verbose                Open CASCADE STEP transfer checks (IFSelect::PrintCheckTransfer)\n"
         << "  -h, --help                   Show this help\n";
 }
@@ -143,6 +150,51 @@ bool ParseCli(int argc, char** argv, CliOptions& out, int& outExitCode)
                 return false;
             }
             out.instanceMinSizeRatio = std::stod(value);
+        }
+        else if (arg == "--proxy-merge-max-tris")
+        {
+            std::string value;
+            if (!requireValue(i, arg, value))
+            {
+                outExitCode = 2;
+                return false;
+            }
+            try
+            {
+                const unsigned long long v = std::stoull(value);
+                if (v == 0ULL)
+                {
+                    std::cerr << "--proxy-merge-max-tris must be > 0.\n";
+                    outExitCode = 2;
+                    return false;
+                }
+                out.proxyMergeMaxTrianglesHardCap = static_cast<std::uint64_t>(v);
+            }
+            catch (const std::exception&)
+            {
+                std::cerr << "--proxy-merge-max-tris must be a positive integer.\n";
+                outExitCode = 2;
+                return false;
+            }
+        }
+        else if (arg == "--proxy-merge-ratio-min-leaf-high-tris")
+        {
+            std::string value;
+            if (!requireValue(i, arg, value))
+            {
+                outExitCode = 2;
+                return false;
+            }
+            try
+            {
+                out.proxyMergeRatioMinLeafHighTris = std::stoull(value);
+            }
+            catch (const std::exception&)
+            {
+                std::cerr << "--proxy-merge-ratio-min-leaf-high-tris must be an integer.\n";
+                outExitCode = 2;
+                return false;
+            }
         }
         else if (!arg.empty() && arg[0] == '-')
         {

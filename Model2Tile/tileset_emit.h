@@ -16,6 +16,8 @@ namespace TilesetEmit
         std::string tileFilePrefix = "tile_";  // tile_0.b3dm, tile_1.b3dm...
         bool keepGlbFilesForDebug = false;
         double viewerTargetSse = 80.0;
+        std::uint64_t proxyMergeMaxTrianglesHardCap = 2000000ULL;
+        std::uint64_t proxyMergeRatioMinLeafHighTris = 50000ULL;
 
         // Pre-baked high/low GLB links are read from SceneIR instances.
         double instanceMinSizeRatio = 1e-3;   // min (instance diagonal / tile diagonal); 0 = no cull

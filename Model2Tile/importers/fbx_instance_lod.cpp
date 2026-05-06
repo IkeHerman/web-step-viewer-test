@@ -269,6 +269,17 @@ bool WriteOccurrenceGlb(const importers::FbxOccurrence& occ, const std::string& 
     {
         AppendBytes(bufferData, *resolvedTextureBytes);
     }
+    // glTF 2.0: index accessors using UNSIGNED_INT require bufferView.byteOffset (plus
+    // accessor.byteOffset) aligned to 4 bytes. Embedded image bytes have arbitrary length,
+    // so pad before the element array to avoid misaligned index reads (needle triangles).
+    constexpr std::size_t kIndexAccessorAlignmentBytes = 4;
+    const std::size_t misalign = bufferData.size() % kIndexAccessorAlignmentBytes;
+    if (misalign != 0)
+    {
+        bufferData.resize(
+            bufferData.size() + (kIndexAccessorAlignmentBytes - misalign),
+            static_cast<unsigned char>(0));
+    }
     const std::size_t indexOffset = bufferData.size();
     AppendBytes(bufferData, indices);
 

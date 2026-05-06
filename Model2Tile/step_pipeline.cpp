@@ -260,7 +260,7 @@ int RunStepPipeline(const CliOptions& cli)
         const double rootMaxSide = BoundsMaxSideLength(globalBoundsAabb);
 
         TileOctree::Config cfg;
-        cfg.maxDepth = 20;
+        cfg.maxDepth = 30;
         cfg.maxItemsPerNode = 96;
         cfg.maxTrianglesPerNode = 30000;
         cfg.minNodeMaxSide = std::max(1e-6, rootMaxSide * 1e-3);
@@ -326,6 +326,8 @@ int RunStepPipeline(const CliOptions& cli)
         opt.keepGlbFilesForDebug = cli.keepGlb;
         opt.viewerTargetSse = cli.viewerTargetSse;
         opt.instanceMinSizeRatio = cli.instanceMinSizeRatio;
+        opt.proxyMergeMaxTrianglesHardCap = cli.proxyMergeMaxTrianglesHardCap;
+        opt.proxyMergeRatioMinLeafHighTris = cli.proxyMergeRatioMinLeafHighTris;
         opt.sceneIr = &sceneIr;
 
         std::cout << "[Config] outDir=" << std::filesystem::absolute(cli.outDir)
@@ -333,7 +335,9 @@ int RunStepPipeline(const CliOptions& cli)
                   << " tilePrefix=" << opt.tileFilePrefix
                   << " keepGlb=" << (opt.keepGlbFilesForDebug ? "true" : "false")
                   << " viewerTargetSse=" << opt.viewerTargetSse
-                  << " instanceMinSizeRatio=" << opt.instanceMinSizeRatio << "\n";
+                  << " instanceMinSizeRatio=" << opt.instanceMinSizeRatio
+                  << " proxyMergeMaxTrianglesHardCap=" << opt.proxyMergeMaxTrianglesHardCap
+                  << " proxyMergeRatioMinLeafHighTris=" << opt.proxyMergeRatioMinLeafHighTris << "\n";
 
         const bool emitOk = TilesetEmit::EmitTilesetAndB3dm(tree, opt);
         if (!emitOk)

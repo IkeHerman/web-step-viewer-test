@@ -27,27 +27,37 @@ namespace glbopt
         float TexcoordStep = 0.0001f;
         float ColorStep = 0.00392156862f;
 
+        /// Max Euclidean distance for position welding vs `PositionStep * WeldPositionMergeStepFraction`.
+        /// `0` = use fraction only. Quantization buckets can span ~`step` per axis; this prevents merging
+        /// unrelated corners that only share a coarse lattice cell.
+        float WeldPositionMergeMaxDistance = 0.0f;
+        float WeldPositionMergeStepFraction = 0.30f;
+
         bool RemoveDegenerateByIndex = true;
         bool RemoveDegenerateByArea = true;
         float DegenerateAreaEpsilonSq = 1e-20f;
 
         bool Simplify = false;
         float SimplifyRatio = 1.0f;
-        float SimplifyError = 1e-2f;
+        float SimplifyError = 2e-2f;
 
         // Per-component weights for meshopt_simplifyWithAttributes (one float per attribute slot).
         float SimplifyNormalWeight = 0.5f;
         float SimplifyTexcoordWeight = 1.0f;
         float SimplifyColorWeight = 0.25f;
 
+        /// When meshopt stalls above `SimplifyRatio` target, run simplifySloppy to approach the triangle budget.
+        /// Off by default: sloppy can scramble connectivity (valid indices, broken triangles).
+        bool SimplifySloppyIfStuck = false;
+
         bool OptimizeVertexCache = true;
         bool OptimizeOverdraw = false;
         float OverdrawThreshold = 1.05f;
         bool OptimizeVertexFetch = true;
 
-        /// Hard cap on total triangles in the output GLB (all merged triangle primitives). Smallest-area
-        /// triangles are dropped first (after weld + degenerate cull). `0` disables the cap.
-        std::uint64_t MaxTriangles = 1000000;
+        /// Hard cap on total triangles in the output GLB (all merged triangle primitives). Triangles with the
+        /// smallest maximum edge length are dropped first (after weld + degenerate cull). `0` disables.
+        std::uint64_t MaxTriangles = 0;
     };
 
     struct Stats
@@ -63,6 +73,7 @@ namespace glbopt
 
         std::size_t InputVertexCount = 0;
         std::size_t OutputVertexCount = 0;
+        /// Vertex slots eliminated by weld quantization (duplicate corners folded onto one index).
         std::size_t MergedVertexCount = 0;
 
         std::size_t InputPrimitiveElementCount = 0;
@@ -79,8 +90,12 @@ namespace glbopt
         std::size_t TrianglesRemovedWeldPhase = 0;
         /// Triangles removed by mesh simplification, summed over triangle primitives.
         std::size_t TrianglesRemovedSimplify = 0;
-        /// Triangles removed to satisfy `MaxTriangles` (smallest-area-first), summed over triangle primitives.
+        /// Triangles removed to satisfy `MaxTriangles` (smallest max-edge first), summed over triangle primitives.
         std::size_t TrianglesRemovedMaxBudget = 0;
+        /// True when this pass configured `MaxTriangles != 0` (budget machinery was considered).
+        bool MaxTrianglesBudgetConfigured = false;
+        /// True when pre-budget merged triangle total exceeded `MaxTriangles` so a trim was attempted.
+        bool MaxTrianglesBudgetOverCap = false;
     };
 
     /// Always fills `outStats` (reset at entry). Callers that do not need metrics may pass a temporary.

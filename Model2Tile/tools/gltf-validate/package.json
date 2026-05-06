@@ -1,0 +1,16 @@
+{
+  "name": "model2tile-gltf-validate",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Khronos glTF validator CLI wrapper for Model2Tile GLB outputs",
+  "scripts": {
+    "validate-glb": "node validate_glb.mjs"
+  },
+  "devDependencies": {
+    "gltf-validator": "2.0.0-dev.3.10"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

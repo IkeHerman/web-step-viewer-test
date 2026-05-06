@@ -2,10 +2,12 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <sstream>
 #include <string>
 #include <map>
 #include <ostream>
@@ -23,6 +25,8 @@
 
 namespace
 {
+    constexpr double kProxyMergeMaxTrianglesRatioVsLeafHigh = 0.50;
+
     static const core::SceneInstance* FindInstanceById(
         const core::SceneIR& sceneIr,
         std::uint32_t id)
@@ -44,6 +48,47 @@ namespace
         }
         return nullptr;
     }
+
+    // #region agent log
+    static void AgentNdjsonLogLeafGlboptFb(
+        const std::uint32_t tileNodeId,
+        const std::string& sourceFormat,
+        const glbopt::Stats& s)
+    {
+        static int s_logged = 0;
+        if (sourceFormat != "fbx" || s_logged >= 16)
+        {
+            return;
+        }
+        ++s_logged;
+        std::ofstream f(
+            "/Users/ikeherman/Desktop/Github/web-step-viewer-test/.cursor/debug-c5c908.log",
+            std::ios::app);
+        if (!f)
+        {
+            return;
+        }
+        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::system_clock::now().time_since_epoch())
+                            .count();
+        const std::size_t inTris = s.InputPrimitiveElementCount / 3u;
+        const std::size_t outTris = s.OutputPrimitiveElementCount / 3u;
+        f << "{\"sessionId\":\"c5c908\",\"runId\":\"post-fix\",\"hypothesisId\":\"H-F\""
+             ",\"location\":\"tileset_emit.cpp:BakeLeafArtifacts\""
+             ",\"message\":\"leaf_glbopt_stats\""
+             ",\"data\":{"
+             "\"tileNodeId\":" << tileNodeId
+             << ",\"inTris\":" << inTris
+             << ",\"outTris\":" << outTris
+             << ",\"removedSimplify\":" << s.TrianglesRemovedSimplify
+             << ",\"dropDegArea\":" << s.DroppedDegenerateByArea
+             << ",\"dropDegId\":" << s.DroppedDegenerateById
+             << ",\"dropInvIdx\":" << s.DroppedTrianglesInvalidIndices
+             << ",\"weldPhaseTrisRemoved\":" << s.TrianglesRemovedWeldPhase
+             << ",\"simplifyTrisRemoved\":" << s.TrianglesRemovedSimplify
+             << "},\"timestamp\":" << ms << "}\n";
+    }
+    // #endregion
 
     static void GetMinMax(const core::Aabb& b,
                           double& xmin, double& ymin, double& zmin,
@@ -194,45 +239,25 @@ namespace
         return true;
     }
 
-    static bool ValidateTileGeometryStats(
-        const glbopt::Stats& stats,
-        bool expectNonEmpty,
-        const std::string& label)
+    /// True when glbopt produced a mesh we can emit as tile content (non-empty triangle list).
+    static bool HasRenderableTriangleMesh(const glbopt::Stats& stats)
     {
-        if (!expectNonEmpty)
-        {
-            return true;
-        }
-
         if (stats.PrimitiveCountMergedOut == 0)
         {
-            std::cout << "[TilesetEmit] rejected " << label
-                      << ": no merged primitives were emitted\n";
             return false;
         }
-
-        if (stats.OutputVertexCount < 3)
-        {
-            std::cout << "[TilesetEmit] rejected " << label
-                      << ": output vertex count too small (" << stats.OutputVertexCount << ")\n";
-            return false;
-        }
-
         if (stats.OutputPrimitiveElementCount < 3)
         {
-            std::cout << "[TilesetEmit] rejected " << label
-                      << ": output index count too small (" << stats.OutputPrimitiveElementCount << ")\n";
             return false;
         }
-
         if ((stats.OutputPrimitiveElementCount % 3u) != 0u)
         {
-            std::cout << "[TilesetEmit] rejected " << label
-                      << ": output index count is not triangle-aligned ("
-                      << stats.OutputPrimitiveElementCount << ")\n";
             return false;
         }
-
+        if (stats.OutputVertexCount < 3)
+        {
+            return false;
+        }
         return true;
     }
 
@@ -241,23 +266,32 @@ namespace
         bool expectNonEmpty,
         const std::string& label)
     {
-        if (!expectNonEmpty || stats.InputVertexCount == 0)
+        const std::uint64_t trisIn = stats.InputPrimitiveElementCount / 3u;
+        if (!expectNonEmpty || trisIn == 0)
         {
             return true;
         }
 
-        const double ratio =
-            static_cast<double>(stats.OutputVertexCount) /
-            static_cast<double>(stats.InputVertexCount);
+        const std::uint64_t trisOut = stats.OutputPrimitiveElementCount / 3u;
+        const double ratio = static_cast<double>(trisOut) / static_cast<double>(trisIn);
 
         if (ratio <= 1e-4)
         {
             std::cout << "[TilesetEmit] rejected " << label
-                      << ": proxy collapsed too aggressively (vertex ratio=" << ratio << ")\n";
+                      << ": proxy collapsed too aggressively (triangle ratio=" << ratio << ")\n";
             return false;
         }
 
         return true;
+    }
+
+    static std::string GlboptTriCountsDebug(const glbopt::Stats& s)
+    {
+        std::ostringstream os;
+        os << "trisOut=" << (s.OutputPrimitiveElementCount / 3u)
+           << " trisIn=" << (s.InputPrimitiveElementCount / 3u)
+           << " triPrimsOut=" << s.PrimitiveCountMergedOut;
+        return os.str();
     }
 
     [[maybe_unused]] static bool ValidateAppearanceCardinality(
@@ -352,16 +386,16 @@ namespace
         float ProxyPositionStep = 1e-5f;
         float LeafPositionStep = 1e-5f;
 
-        // glbopt attribute quantization from `BuildNodeTuning` (diagonal vs root); Leaf_* mirrors Proxy_*.
+        // glbopt weld quantization: global epsilon (`node_scale_helpers`), not octree-scaled; Leaf_* mirrors Proxy_*.
         float ProxyNormalStep = 1e-4f;
         float ProxyTexcoordStep = 1e-5f;
         float LeafNormalStep = 1e-4f;
         float LeafTexcoordStep = 1e-6f;
 
-        float ProxySimplifyRatio = 0.2f;
+        float ProxySimplifyRatio = 0.15f;
         float ProxySimplifyError = 1e-2f;
 
-        float LeafSimplifyRatio = 0.96f;
+        float LeafSimplifyRatio = 0.85f;
         float LeafSimplifyError = 2e-3f;
 
         double GeometricError = 0.0;
@@ -418,18 +452,26 @@ namespace
         const float aggressiveness =
             Clamp01((1.0f - tuning.RelativeSize) * 0.65f + tuning.NormalizedDepth * 0.35f);
 
-        const double weldStep = model2tile::ComputeNodeBoxWeldStep(nodeDiag, rootDiag);
-        const double relToRoot = model2tile::NodeToRootDiagonalRatio(nodeDiag, rootDiag);
+        const double sseScale =
+            model2tile::ClampViewerSseScaleTileDefault(viewerTargetSse);
 
-        // Shared leaf/proxy glbopt tuning: same formulas; node diagonal differs by octree level.
-        const float positionStep = static_cast<float>(weldStep);
-        const float normalStep = static_cast<float>(
-            model2tile::ClampDouble(1.5e-3 * relToRoot, 3e-5, 2e-2));
-        const float texcoordStep = static_cast<float>(
-            model2tile::ClampDouble(5.0e-6 * relToRoot, 1e-9, 1e-3));
-        // Another ~2x triangle removal vs [0.71, 0.84]: double (1 - ratio) at each end.
+        const double positionStepDiag = model2tile::GlobalVertexWeldPositionStep();
+        const float positionStep =
+            static_cast<float>(model2tile::ClampDouble(positionStepDiag, 1e-12, 1e9));
+        const float normalStep =
+            static_cast<float>(model2tile::ClampDouble(
+                model2tile::ComputeWeldNormalStepFromPositionStep(positionStepDiag),
+                1e-12,
+                1.0));
+        const float texcoordStep =
+            static_cast<float>(model2tile::ClampDouble(
+                model2tile::ComputeWeldTexcoordStepFromPositionStep(positionStepDiag),
+                1e-12,
+                1.0));
+
+        // Lower ratios = fewer triangles retained (more aggressive LOD).
         const float simplifyRatio =
-            LerpClamped(0.42f, 0.68f, 1.0f - aggressiveness);
+            LerpClamped(0.18f, 0.42f, 1.0f - aggressiveness);
 
         tuning.ProxyPositionStep = positionStep;
         tuning.LeafPositionStep = positionStep;
@@ -437,7 +479,7 @@ namespace
         tuning.LeafNormalStep = normalStep;
         tuning.ProxyTexcoordStep = texcoordStep;
         tuning.LeafTexcoordStep = texcoordStep;
-        tuning.ProxySimplifyRatio = simplifyRatio;
+        tuning.ProxySimplifyRatio = std::max(0.02f, simplifyRatio * 0.45f);
         tuning.LeafSimplifyRatio = simplifyRatio;
 
         // Geometric error model (octree-aligned): same diagonal-based error for simplify tuning on
@@ -446,7 +488,6 @@ namespace
         constexpr double kGeomErrMinFraction = 0.08;
         constexpr double kGeomErrMaxFraction = 0.35;
 
-        const double sseScale = model2tile::ClampViewerSseScaleTileDefault(viewerTargetSse);
         const double geomErrForSimplify = model2tile::ClampDiagonalGeometricError(
             nodeDiag,
             sseScale,
@@ -459,16 +500,16 @@ namespace
         const double errorFromGeom =
             std::max(1e-8, geomErrForSimplify / std::max(1e-9, rootDiag));
 
-        // Meshoptimizer relative error cap (shared leaf/proxy). 2x more aggressive vs 2.5.
-        constexpr double kSimplifyErrorScale = 5.0;
+        // Larger scale = tolerate more collapses → stronger simplification toward SimplifyRatio.
+        constexpr double kSimplifyErrorScale = 17.0;
         const double simplifyErrorUnscaled =
-            std::max(0.0015, errorFromGeom * 0.40) *
-            (0.85 + 0.30 * static_cast<double>(tuning.NormalizedDepth));
+            std::max(0.0022, errorFromGeom * 0.62) *
+            (0.92 + 0.34 * static_cast<double>(tuning.NormalizedDepth));
         const float simplifyError = static_cast<float>(model2tile::ClampDouble(
             simplifyErrorUnscaled * kSimplifyErrorScale,
-            0.0015 * kSimplifyErrorScale,
-            0.02 * kSimplifyErrorScale));
-        tuning.ProxySimplifyError = simplifyError;
+            0.0022 * kSimplifyErrorScale,
+            0.034 * kSimplifyErrorScale));
+        tuning.ProxySimplifyError = simplifyError * 5.0f;
         tuning.LeafSimplifyError = simplifyError;
 
         return tuning;
@@ -479,12 +520,12 @@ namespace
     {
         o.PositionStep = tuning.ProxyPositionStep;
         o.NormalStep = tuning.ProxyNormalStep;
-        o.TexcoordStep = 0.0f;
+        o.TexcoordStep = tuning.ProxyTexcoordStep;
         o.ColorStep = 1.0f / 255.0f;
     }
 
-    /// Second-phase proxy merge: simplify off (inputs already simplified); weld + dedup + degenerates +
-    /// vertex layout on merged proxy. Weld steps come from `tuning` (same source as downscale/leaf).
+    /// Second-phase proxy merge: weld + dedup + degenerates + simplify + vertex layout on merged proxy.
+    /// Uses proxy-specific simplify tuning so internal LODs can be substantially cheaper than leaf detail.
     static glbopt::Options BuildProxyCombineAfterLeafDownscaleOptions(const NodeTuning& tuning)
     {
         glbopt::Options o;
@@ -495,16 +536,24 @@ namespace
         o.WeldColor0 = true;
         o.ForceDoubleSidedMaterials = false;
         ApplyNodeTuningWeldQuantization(o, tuning);
-        o.Simplify = false;
+        o.Simplify = true;
+        o.SimplifyRatio = tuning.ProxySimplifyRatio;
+        o.SimplifyError = tuning.ProxySimplifyError;
+        o.SimplifyNormalWeight = 0.10f;
+        o.SimplifyTexcoordWeight = 0.14f;
+        o.SimplifyColorWeight = 0.04f;
         o.RemoveDegenerateByIndex = true;
         o.RemoveDegenerateByArea = true;
         o.DegenerateAreaEpsilonSq = 1e-20f;
         o.OptimizeVertexCache = true;
+        o.OptimizeOverdraw = true;
+        o.OverdrawThreshold = 1.08f;
         o.OptimizeVertexFetch = true;
+        o.SimplifySloppyIfStuck = true;
         return o;
     }
 
-    /// Leaf glbopt pass: weld, dedup, degenerate cleanup, simplify, vertex layout (see `BuildMergedInstanceGlbOptOptions`).
+    /// Leaf glbopt pass: weld, dedup, degenerate cleanup, simplify, vertex layout.
     static glbopt::Options BuildLeafGlbOptOptionsForNode(const NodeTuning& tuning)
     {
         glbopt::Options options;
@@ -524,9 +573,13 @@ namespace
         options.Simplify = true;
         options.SimplifyRatio = tuning.LeafSimplifyRatio;
         options.SimplifyError = tuning.LeafSimplifyError;
+        options.SimplifyNormalWeight = 0.10f;
+        options.SimplifyTexcoordWeight = 0.14f;
+        options.SimplifyColorWeight = 0.04f;
 
         options.OptimizeVertexCache = true;
-        options.OptimizeOverdraw = false;
+        options.OptimizeOverdraw = true;
+        options.OverdrawThreshold = 1.08f;
         options.OptimizeVertexFetch = true;
 
         return options;
@@ -536,7 +589,11 @@ namespace
     {
         glbopt::Options options = BuildLeafGlbOptOptionsForNode(parentTuning);
         // Low-for-parent should be more aggressive than the node's high tile pass.
-        ScaleGlboptAggression(options, 1.8f);
+        ScaleGlboptAggression(options, 6.5f);
+        options.SimplifyNormalWeight = 0.10f;
+        options.SimplifyTexcoordWeight = 0.14f;
+        options.SimplifyColorWeight = 0.04f;
+        options.SimplifySloppyIfStuck = true;
         return options;
     }
 
@@ -545,6 +602,9 @@ namespace
         std::uint32_t nodeId = 0;
         bool isLeaf = false;
         core::Aabb bounds;
+        std::uint64_t HighTriangleCount = 0;
+        std::uint64_t LowForParentTriangleCount = 0;
+        std::uint64_t SubtreeLeafHighTriangleCount = 0;
         std::filesystem::path HighGlbPath;
         std::filesystem::path LowForParentGlbPath;
         std::filesystem::path GlbPath;
@@ -584,13 +644,7 @@ namespace
         {
             return;
         }
-        o.PositionStep *= factor;
-        o.NormalStep *= factor;
-        if (o.TexcoordStep > 0.0f)
-        {
-            o.TexcoordStep *= factor;
-        }
-        o.ColorStep *= factor;
+        // Weld quantization is fixed global epsilon; only simplify is scaled here.
         o.SimplifyError *= factor;
         if (o.Simplify && o.SimplifyRatio < 1.0f)
         {
@@ -617,7 +671,7 @@ namespace
 
         const std::filesystem::path rawFullGlbPath = tilesDir / (baseName + "_raw.glb");
         const std::filesystem::path fullGlbPath = tilesDir / (baseName + ".glb");
-        const std::filesystem::path lowGlbPath = tilesDir / (baseName + "__low.glb");
+        const std::filesystem::path lowGlbPath = tilesDir / (baseName + "_low.glb");
         const std::filesystem::path fullB3dmPath = tilesDir / (baseName + ".b3dm");
 
         std::vector<std::pair<std::uint32_t, core::Transform4d>> leafInstances;
@@ -658,7 +712,7 @@ namespace
             opt.viewerTargetSse);
 
         glbopt::Stats leafOptStats;
-        const glbopt::Options leafGlbOpt = BuildLeafGlbOptOptionsForNode(leafTuning);
+        glbopt::Options leafGlbOpt = BuildLeafGlbOptOptionsForNode(leafTuning);
         if (!glbopt::OptimizeGlbFile(
                 rawFullGlbPath.string(),
                 fullGlbPath.string(),
@@ -669,10 +723,27 @@ namespace
             std::cerr << "[TilesetEmit] leaf high optimize failed tile=" << baseName << "\n";
             return false;
         }
-        if (!ValidateTileGeometryStats(leafOptStats, true, baseName))
+        if (!HasRenderableTriangleMesh(leafOptStats))
         {
-            return false;
+            std::cout << "[TilesetEmit] skipping tile=" << baseName
+                      << " kind=leaf: mesh degenerated to empty/non-renderable"
+                      << " (" << GlboptTriCountsDebug(leafOptStats) << ")\n";
+            std::error_code ec;
+            std::filesystem::remove(fullGlbPath, ec);
+            std::filesystem::remove(rawFullGlbPath, ec);
+            artifact.GlbPath.clear();
+            artifact.ContentUri.clear();
+            artifact.HighGlbPath.clear();
+            artifact.LowForParentGlbPath.clear();
+            artifact.HighTriangleCount = 0;
+            artifact.LowForParentTriangleCount = 0;
+            artifact.SubtreeLeafHighTriangleCount = 0;
+            return true;
         }
+
+        // #region agent log
+        AgentNdjsonLogLeafGlboptFb(artifact.nodeId, sceneIr.sourceFormat, leafOptStats);
+        // #endregion
 
         if (parentCellBounds && parentCellBounds->valid)
         {
@@ -683,7 +754,7 @@ namespace
                 maxDepth,
                 false,
                 opt.viewerTargetSse);
-            const glbopt::Options lowOptions = BuildLowForParentGlbOptOptions(parentTuning);
+            glbopt::Options lowOptions = BuildLowForParentGlbOptOptions(parentTuning);
             glbopt::Stats lowStats{};
             if (!glbopt::OptimizeGlbFile(
                     fullGlbPath.string(),
@@ -696,7 +767,16 @@ namespace
                 return false;
             }
             artifact.LowForParentGlbPath = lowGlbPath;
+            artifact.LowForParentTriangleCount =
+                static_cast<std::uint64_t>(lowStats.OutputPrimitiveElementCount / 3u);
         }
+        artifact.HighTriangleCount =
+            static_cast<std::uint64_t>(leafOptStats.OutputPrimitiveElementCount / 3u);
+        if (artifact.LowForParentTriangleCount == 0)
+        {
+            artifact.LowForParentTriangleCount = artifact.HighTriangleCount;
+        }
+        artifact.SubtreeLeafHighTriangleCount = artifact.HighTriangleCount;
 
         std::cout << "[TileExport] tile=" << baseName << " kind=leaf"
                   << " materialsCanonical=" << leafOptStats.MaterialCountCanonical
@@ -756,11 +836,27 @@ namespace
         std::filesystem::create_directories(tilesDir);
 
         const std::filesystem::path proxyGlbPath = tilesDir / (baseName + ".glb");
-        const std::filesystem::path lowGlbPath = tilesDir / (baseName + "__low.glb");
+        const std::filesystem::path lowGlbPath = tilesDir / (baseName + "_low.glb");
         const std::filesystem::path proxyB3dmPath = tilesDir / (baseName + ".b3dm");
 
         std::vector<std::string> childLowGlbPaths;
         CollectImmediateChildLowGlbPaths(node, bakeState, childLowGlbPaths);
+        std::uint64_t childLeafHighTrisSum = 0;
+        std::uint64_t childLowTrisSum = 0;
+        for (const auto& childPtr : node.children)
+        {
+            if (!childPtr)
+            {
+                continue;
+            }
+            const auto it = bakeState.artifacts.find(childPtr.get());
+            if (it == bakeState.artifacts.end())
+            {
+                continue;
+            }
+            childLeafHighTrisSum += it->second.SubtreeLeafHighTriangleCount;
+            childLowTrisSum += it->second.LowForParentTriangleCount;
+        }
 
         if (childLowGlbPaths.empty())
         {
@@ -779,6 +875,53 @@ namespace
 
         glbopt::Options mergePassOpts = BuildProxyCombineAfterLeafDownscaleOptions(highTuning);
         mergePassOpts.ForceDoubleSidedMaterials = false;
+        if (childLeafHighTrisSum > 0 &&
+            childLeafHighTrisSum > opt.proxyMergeRatioMinLeafHighTris)
+        {
+            const std::uint64_t ratioBudget = std::max<std::uint64_t>(
+                1u,
+                static_cast<std::uint64_t>(
+                    std::ceil(
+                        static_cast<double>(childLeafHighTrisSum) *
+                        kProxyMergeMaxTrianglesRatioVsLeafHigh)));
+            mergePassOpts.MaxTriangles =
+                std::min(ratioBudget, opt.proxyMergeMaxTrianglesHardCap);
+        }
+        std::cout << "[ProxyMerge] parent=" << baseName << " mergeInputs=" << childLowGlbPaths.size()
+                  << " leafHighSum=" << childLeafHighTrisSum << " childLowSum=" << childLowTrisSum;
+        if (mergePassOpts.MaxTriangles > 0)
+        {
+            std::cout << " maxTriangles=" << mergePassOpts.MaxTriangles;
+        }
+        else if (childLeafHighTrisSum > 0 &&
+                 childLeafHighTrisSum <= opt.proxyMergeRatioMinLeafHighTris)
+        {
+            std::cout << " ratioBudget=skipped(leafHighSum<="
+                      << opt.proxyMergeRatioMinLeafHighTris << ")";
+        }
+        std::cout << "\n";
+        {
+            std::size_t ordinal = 0;
+            for (const auto& childPtr : node.children)
+            {
+                if (!childPtr)
+                {
+                    continue;
+                }
+                const auto it = bakeState.artifacts.find(childPtr.get());
+                if (it == bakeState.artifacts.end() || it->second.LowForParentGlbPath.empty())
+                {
+                    continue;
+                }
+                const std::string childBase =
+                    opt.tileFilePrefix + std::to_string(it->second.nodeId);
+                std::cout << "[ProxyMerge]   child[" << ordinal << "] tile=" << childBase
+                          << " glb=" << it->second.LowForParentGlbPath.filename().string()
+                          << " subtreeLeafHighTris=" << it->second.SubtreeLeafHighTriangleCount
+                          << " lowTris=" << it->second.LowForParentTriangleCount << "\n";
+                ++ordinal;
+            }
+        }
         glbopt::Stats proxyStats;
         if (!glbopt::OptimizeGlbFiles(
                 childLowGlbPaths,
@@ -790,10 +933,24 @@ namespace
             std::cerr << "[TilesetEmit] proxy merge failed tile=" << baseName << "\n";
             return false;
         }
-        if (!ValidateTileGeometryStats(proxyStats, true, baseName))
+        if (!HasRenderableTriangleMesh(proxyStats))
         {
-            return false;
+            std::cout << "[TilesetEmit] skipping tile=" << baseName
+                      << " kind=proxy: merged mesh degenerated to empty/non-renderable"
+                      << " (" << GlboptTriCountsDebug(proxyStats) << ")\n";
+            std::error_code ec;
+            std::filesystem::remove(proxyGlbPath, ec);
+            artifact.GlbPath.clear();
+            artifact.ContentUri.clear();
+            artifact.HighGlbPath.clear();
+            artifact.LowForParentGlbPath.clear();
+            artifact.HighTriangleCount = 0;
+            artifact.LowForParentTriangleCount = 0;
+            artifact.SubtreeLeafHighTriangleCount = childLeafHighTrisSum;
+            return true;
         }
+        artifact.HighTriangleCount =
+            static_cast<std::uint64_t>(proxyStats.OutputPrimitiveElementCount / 3u);
 
         if (parentCellBounds && parentCellBounds->valid)
         {
@@ -804,7 +961,7 @@ namespace
                 maxDepth,
                 false,
                 opt.viewerTargetSse);
-            const glbopt::Options lowOptions = BuildLowForParentGlbOptOptions(parentTuning);
+            glbopt::Options lowOptions = BuildLowForParentGlbOptOptions(parentTuning);
             glbopt::Stats lowStats{};
             if (!glbopt::OptimizeGlbFile(
                     proxyGlbPath.string(),
@@ -817,11 +974,32 @@ namespace
                 return false;
             }
             artifact.LowForParentGlbPath = lowGlbPath;
+            artifact.LowForParentTriangleCount =
+                static_cast<std::uint64_t>(lowStats.OutputPrimitiveElementCount / 3u);
         }
+        if (artifact.LowForParentTriangleCount == 0)
+        {
+            artifact.LowForParentTriangleCount = artifact.HighTriangleCount;
+        }
+        artifact.SubtreeLeafHighTriangleCount = childLeafHighTrisSum;
+
+        const double ratioVsLeafHigh = childLeafHighTrisSum > 0
+            ? static_cast<double>(artifact.HighTriangleCount) /
+                static_cast<double>(childLeafHighTrisSum)
+            : 0.0;
+        const double ratioVsChildLow = childLowTrisSum > 0
+            ? static_cast<double>(artifact.HighTriangleCount) /
+                static_cast<double>(childLowTrisSum)
+            : 0.0;
         std::cout << "[TileExport] tile=" << baseName << " kind=proxy"
                   << " children=" << childLowGlbPaths.size()
                   << " materials=" << proxyStats.MaterialCountCanonical
-                  << " tris=" << (proxyStats.OutputPrimitiveElementCount / 3) << "\n";
+                  << " tris=" << (proxyStats.OutputPrimitiveElementCount / 3)
+                  << " leafHighSum=" << childLeafHighTrisSum
+                  << " childLowSum=" << childLowTrisSum
+                  << " ratioVsLeafHigh=" << std::fixed << std::setprecision(3) << ratioVsLeafHigh
+                  << " ratioVsChildLow=" << ratioVsChildLow
+                  << std::defaultfloat << "\n";
 
         const std::map<std::string, std::string> tileMetadata = {
             { "tileId", std::to_string(artifact.nodeId) },

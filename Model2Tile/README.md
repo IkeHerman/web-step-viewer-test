@@ -150,6 +150,31 @@ out/tileset/instance_lods/
   ...
 ```
 
+## Validating GLB exports (Khronos glTF Validator)
+
+Standalone `.glb` files can be checked with the official [gltf-validator](https://www.npmjs.com/package/gltf-validator) via a small CLI in this repo. Requires **Node.js 18+**.
+
+From `Model2Tile/`:
+
+```bash
+cd tools/gltf-validate
+npm ci
+node validate_glb.mjs path/to/output/tiles path/to/output/instance_lods
+```
+
+Options:
+
+- `--fail-on-warnings` — exit with status 1 if any warning or error is reported (default: errors only).
+- `--json` — print a JSON array of `{ "file", "report" }` objects to stdout.
+
+Or use the Makefile wrapper (paths are relative to the `Model2Tile/` directory):
+
+```bash
+make validate-glb GLB_DIR=../Tile-Viewer/public/tiles
+```
+
+This validates every `*.glb` under that directory recursively (excluding `node_modules`). It does **not** inspect `.b3dm` tiles directly; validate intermediate `.glb` files (for example with `--keep-glb`) or extend tooling later to extract GLB from batch 3D Model containers.
+
 ## FBX Scope (first pass)
 
 - Preserves FBX node instances (shared meshes produce multiple SceneIR instances with unique transforms).

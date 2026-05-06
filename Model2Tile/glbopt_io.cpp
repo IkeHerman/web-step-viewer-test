@@ -1,10 +1,12 @@
 #include "glbopt_internal.h"
+#include "gltf_buffer_consolidate.h"
 
 #include <algorithm>
 #include <cmath>
 #include <filesystem>
 #include <iostream>
 #include <limits>
+#include <string>
 
 namespace glbopt
 {
@@ -312,6 +314,47 @@ namespace glbopt
                 }
                 return false;
             }
+
+            // Some sources omit mode (tinygltf uses -1). glTF default is TRIANGLES.
+            const int normalizedMode =
+                (primitive.mode >= 0) ? primitive.mode : TINYGLTF_MODE_TRIANGLES;
+
+            // Triangle and line lists must align to 3 and 2 indices; meshoptimizer assumes this.
+            if (normalizedMode == TINYGLTF_MODE_TRIANGLES)
+            {
+                if (primitive.indices < 0 && (vertexCount % 3) != 0)
+                {
+                    if (ioStats)
+                    {
+                        ++ioStats->DroppedPrimitivesInvalidIndices;
+                    }
+                    return false;
+                }
+                const std::size_t n = outData.Indices.size();
+                const std::size_t rem = n % 3;
+                if (rem != 0)
+                {
+                    outData.Indices.resize(n - rem);
+                }
+                if (outData.Indices.empty())
+                {
+                    if (ioStats)
+                    {
+                        ++ioStats->DroppedPrimitivesInvalidAccessor;
+                    }
+                    return false;
+                }
+            }
+            else if (normalizedMode == TINYGLTF_MODE_LINE)
+            {
+                const std::size_t n = outData.Indices.size();
+                const std::size_t rem = n % 2;
+                if (rem != 0 && n > rem)
+                {
+                    outData.Indices.resize(n - rem);
+                }
+            }
+
             for (const std::uint32_t idx : outData.Indices)
             {
                 if (idx >= vertexCount)
@@ -327,9 +370,7 @@ namespace glbopt
             outData.Vertices.resize(vertexCount);
             outData.Material = primitive.material;
 
-            // Some sources omit mode (tinygltf uses -1). glTF default is TRIANGLES.
-            // Normalize here so downstream optimization/rewrite never emits invalid mode.
-            outData.Mode = (primitive.mode >= 0) ? primitive.mode : TINYGLTF_MODE_TRIANGLES;
+            outData.Mode = normalizedMode;
 
             for (std::size_t i = 0; i < vertexCount; ++i)
             {
@@ -403,6 +444,12 @@ namespace glbopt
 
         bool WriteGlb(tinygltf::Model& model, const std::string& outputPath)
         {
+            std::string consolidateErr;
+            if (!model2tile::ConsolidateGltfBuffersToSingle(model, consolidateErr))
+            {
+                std::cout << "[glbopt] buffer consolidate failed: " << consolidateErr << "\n";
+                return false;
+            }
             tinygltf::TinyGLTF gltf;
             return gltf.WriteGltfSceneToFile(&model, outputPath, true, true, false, true);
         }
@@ -426,13 +473,20 @@ namespace glbopt
             const long long roundedPct = static_cast<long long>(std::llround(std::abs(changePct)));
             const char* changeWord = (changePct >= 0.0) ? "Reduction" : "Increase";
 
-            const long long wNeg = -static_cast<long long>(stats.TrianglesRemovedWeldPhase);
+            // Triangle deltas: weld+degen phase (Wtri), simplify (S), optional max-triangle budget trim (B).
+            const long long weldPhaseTriDeltaNeg = -static_cast<long long>(stats.TrianglesRemovedWeldPhase);
             const long long sNeg = -static_cast<long long>(stats.TrianglesRemovedSimplify);
             const long long bNeg = -static_cast<long long>(stats.TrianglesRemovedMaxBudget);
 
             std::cout << "[glbopt][" << passTag << "] in=" << inputFile
-                      << " out=" << outputFile << " Tris: " << trisOut
-                      << " (W:" << wNeg << " S:" << sNeg << " B:" << bNeg << ") " << roundedPct << "% "
+                      << " out=" << outputFile << " tris " << trisOut << "/" << trisIn
+                      << " (Wtri:" << weldPhaseTriDeltaNeg << " S:" << sNeg;
+            // B only when trim was attempted (over cap). Under cap before budget -> omit B. Over cap -> B:0 ok if trim removed 0.
+            if (stats.MaxTrianglesBudgetConfigured && stats.MaxTrianglesBudgetOverCap)
+            {
+                std::cout << " B:" << bNeg;
+            }
+            std::cout << ") " << roundedPct << "% "
                       << changeWord << "\n";
         }
     }

@@ -49,7 +49,7 @@ int RunFbxPipeline(const CliOptions& cli)
 
     const std::vector<tiler::TileItem> irTileItems = tiler::BuildTileItemsFromSceneIR(sceneIr);
     TileOctree::Config cfg;
-    cfg.maxDepth = 20;
+    cfg.maxDepth = 30;
     cfg.maxItemsPerNode = 96;
     cfg.maxTrianglesPerNode = 30000;
     cfg.minNodeMaxSide = 1e-6;
@@ -65,6 +65,8 @@ int RunFbxPipeline(const CliOptions& cli)
     opt.keepGlbFilesForDebug = cli.keepGlb;
     opt.viewerTargetSse = cli.viewerTargetSse;
     opt.instanceMinSizeRatio = cli.instanceMinSizeRatio;
+    opt.proxyMergeMaxTrianglesHardCap = cli.proxyMergeMaxTrianglesHardCap;
+    opt.proxyMergeRatioMinLeafHighTris = cli.proxyMergeRatioMinLeafHighTris;
     opt.sceneIr = &sceneIr;
 
     if (!TilesetEmit::EmitTilesetAndB3dm(tree, opt))

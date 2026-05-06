@@ -13,9 +13,12 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <sstream>
 #include <string>
@@ -25,6 +28,31 @@
 namespace
 {
 #if MODEL2TILE_HAS_ASSIMP
+// #region agent log
+void AgentNdjsonLog(
+    const char* hypothesisId,
+    const char* location,
+    const char* message,
+    const std::string& dataJson)
+{
+    std::ofstream f(
+        "/Users/ikeherman/Desktop/Github/web-step-viewer-test/.cursor/debug-c5c908.log",
+        std::ios::app);
+    if (!f)
+    {
+        return;
+    }
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::system_clock::now().time_since_epoch())
+                        .count();
+    f << "{\"sessionId\":\"c5c908\",\"runId\":\"post-fix\",\"hypothesisId\":\"" << hypothesisId
+      << "\",\"location\":\"" << location << "\",\"message\":\"" << message << "\",\"data\":"
+      << dataJson << ",\"timestamp\":" << ms << "}\n";
+}
+// #endregion
+
+std::size_t g_streamProtoReuseCount = 0;
+
 core::Aabb InvalidAabb()
 {
     return core::Aabb{};
@@ -64,26 +92,50 @@ std::array<double, 3> TransformPoint(const aiMatrix4x4& matrix, const aiVector3D
     return {static_cast<double>(t.x), static_cast<double>(t.y), static_cast<double>(t.z)};
 }
 
+void Fnv1a64Update(std::uint64_t& h, const void* data, const std::size_t len)
+{
+    const auto* p = static_cast<const std::uint8_t*>(data);
+    for (std::size_t i = 0; i < len; ++i)
+    {
+        h ^= static_cast<std::uint64_t>(p[i]);
+        h *= 1099511628211ULL;
+    }
+}
+
+/// Stable fingerprint of Assimp mesh connectivity + vertex positions (raw float bytes).
+/// Prototype dedup keys previously used only coarse counts + rounded bbox, which collided often vs STEP's richer signatures.
+std::uint64_t FingerprintAiMeshGeometry(const aiMesh& mesh)
+{
+    std::uint64_t h = 14695981039346656037ULL;
+    const unsigned int nv = mesh.mNumVertices;
+    for (unsigned int v = 0; v < nv; ++v)
+    {
+        const aiVector3D& p = mesh.mVertices[v];
+        Fnv1a64Update(h, &p.x, sizeof(float) * 3);
+    }
+    const unsigned int nf = mesh.mNumFaces;
+    for (unsigned int fi = 0; fi < nf; ++fi)
+    {
+        const aiFace& face = mesh.mFaces[fi];
+        Fnv1a64Update(h, &face.mNumIndices, sizeof(face.mNumIndices));
+        if (face.mNumIndices > 0 && face.mIndices != nullptr)
+        {
+            Fnv1a64Update(h, face.mIndices, sizeof(unsigned int) * face.mNumIndices);
+        }
+    }
+    return h;
+}
+
 std::string BuildGeometryKey(const aiMesh& mesh, const core::Aabb& localBounds)
 {
+    (void)localBounds;
+    const std::uint64_t geo = FingerprintAiMeshGeometry(mesh);
     std::ostringstream ss;
     ss << "mesh:"
        << mesh.mNumVertices << ":"
        << mesh.mNumFaces << ":"
-       << mesh.mPrimitiveTypes << ":";
-    if (localBounds.valid)
-    {
-        ss << std::round(localBounds.xmin * 100000.0) << ":"
-           << std::round(localBounds.ymin * 100000.0) << ":"
-           << std::round(localBounds.zmin * 100000.0) << ":"
-           << std::round(localBounds.xmax * 100000.0) << ":"
-           << std::round(localBounds.ymax * 100000.0) << ":"
-           << std::round(localBounds.zmax * 100000.0);
-    }
-    else
-    {
-        ss << "void";
-    }
+       << mesh.mPrimitiveTypes << ":geo:"
+       << std::hex << std::setw(16) << std::setfill('0') << geo << std::dec;
     return ss.str();
 }
 
@@ -394,6 +446,12 @@ bool TraverseNode(
                     }
                     uriMap.emplace(protoKey, streamState->outputUriPrefix + "/" + stem + "_high.glb");
                 }
+                else
+                {
+                    // #region agent log
+                    ++g_streamProtoReuseCount;
+                    // #endregion
+                }
 
                 // Release heavy geometry/texture buffers once this occurrence is persisted.
                 occ.meshPayload = importers::FbxMeshPayload{};
@@ -420,6 +478,27 @@ bool TraverseNode(
     }
     return true;
 }
+
+// #region agent log
+void FbxAgentResetReuseCounter()
+{
+    g_streamProtoReuseCount = 0;
+}
+
+void FbxAgentLogReuseSummary(const std::size_t uniquePrototypeGlbs)
+{
+    AgentNdjsonLog(
+        "H-D",
+        "fbx_traversal.cpp:CollectFbxOccurrencesAndBakeLods",
+        "prototype_reuse_summary",
+        std::string("{\"reuseOccurrences\":") + std::to_string(g_streamProtoReuseCount) +
+            ",\"uniquePrototypeGlbs\":" + std::to_string(uniquePrototypeGlbs) + "}");
+    // Mirrors NDJSON so verification works even if the debug log path cannot be opened.
+    std::cout << "[FbxTraversal][agent-debug] prototype_reuse_summary reuseOccurrences="
+              << g_streamProtoReuseCount << " uniquePrototypeGlbs=" << uniquePrototypeGlbs << "\n";
+}
+// #endregion
+
 #endif
 } // namespace
 
@@ -523,6 +602,10 @@ bool CollectFbxOccurrencesAndBakeLods(
     std::unordered_map<unsigned int, std::size_t> meshUseCount;
     CountMeshReferences(scene->mRootNode, meshUseCount);
 
+    // #region agent log
+    FbxAgentResetReuseCounter();
+    // #endregion
+
     StreamBakeState streamState;
     streamState.outputDirectory = outputDirectory;
     streamState.outputUriPrefix = outputUriPrefix;
@@ -543,6 +626,10 @@ bool CollectFbxOccurrencesAndBakeLods(
     {
         return false;
     }
+
+    // #region agent log
+    FbxAgentLogReuseSummary(outPrototypeHighLodUrisByQualifiedKey.size());
+    // #endregion
 
     std::cout << "[FbxTraversal] occurrences=" << outOccurrences.size()
               << " prototypeHighGlbs=" << outPrototypeHighLodUrisByQualifiedKey.size() << "\n";

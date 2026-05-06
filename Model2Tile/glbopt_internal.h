@@ -3,6 +3,7 @@
 #include "glbopt.h"
 #include "dep/tinygltf/tiny_gltf.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <unordered_map>
@@ -44,6 +45,10 @@ namespace glbopt
             std::uint8_t HasTexcoord0 = 0;
             std::uint8_t HasColor0 = 0;
         };
+
+        static_assert(std::is_standard_layout_v<PackedVertex>, "meshopt uses raw stride over PackedVertex");
+        static_assert(offsetof(PackedVertex, Position) == 0, "meshopt expects float3 at vertex+0");
+        static_assert(offsetof(PackedVertex, Normal) == sizeof(float) * 3, "tight float3 block after position");
 
         struct PrimitiveData
         {
